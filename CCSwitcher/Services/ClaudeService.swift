@@ -111,7 +111,7 @@ final class ClaudeService: Sendable {
             throw ClaudeServiceError.invalidOutput
         }
         let status = try JSONDecoder().decode(AuthStatus.self, from: data)
-        log.info("[getAuthStatus] loggedIn=\(status.loggedIn), provider=\(status.apiProvider ?? "nil"), sub=\(status.subscriptionType ?? "nil")")
+        log.info("[getAuthStatus] loggedIn=\(status.loggedIn), method=\(status.authMethod ?? "nil"), provider=\(status.apiProvider ?? "nil")")
         return status
     }
 
@@ -176,6 +176,69 @@ final class ClaudeService: Sendable {
         return accessToken
     }
 
+    // MARK: - Cloud-feature scope probe
+
+    /// Result of probing whether a token has the modern OAuth scopes required
+    /// for Claude Code on the web (e.g. /ultraplan, /ultrareview, remote sessions).
+    enum ScopeProbeResult: Sendable {
+        /// Token is valid and has cloud-session scopes.
+        case ok
+        /// Token authenticates but lacks the scopes for cloud features.
+        /// Re-authentication is required (refresh_token cannot upgrade scopes per OAuth 2.0).
+        case staleScope
+        /// Network or transient error. Caller should fall through, not block.
+        case transientError
+    }
+
+    /// Probes /v1/environment_providers to determine whether `accessToken` has
+    /// the modern OAuth scopes Claude Code's cloud features require.
+    /// Read-only HTTPS GET; no side effects on Anthropic side.
+    /// Throws `CancellationError` if the surrounding Task is cancelled — never
+    /// swallows cancellation as a "transient" outcome.
+    func probeCloudScopes(accessToken: String) async throws -> ScopeProbeResult {
+        guard let url = URL(string: "https://api.anthropic.com/v1/environment_providers") else {
+            return .transientError
+        }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.timeoutInterval = 8
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                log.warning("[probeCloudScopes] non-HTTP response, treating as transient")
+                return .transientError
+            }
+            switch http.statusCode {
+            case 200:
+                log.info("[probeCloudScopes] HTTP 200 — cloud scopes present")
+                return .ok
+            case 403:
+                let body = String(data: data, encoding: .utf8) ?? ""
+                if body.contains("OAuth token does not meet scope requirement") {
+                    log.warning("[probeCloudScopes] HTTP 403 stale-scope — token needs re-auth")
+                    return .staleScope
+                }
+                // Future-proof: if Anthropic changes wording, surface the body so we can
+                // fix-forward. body.prefix(200) keeps the log line bounded.
+                log.warning("[probeCloudScopes] HTTP 403 (non-scope match) — body: \(body.prefix(200))")
+                return .transientError
+            default:
+                log.warning("[probeCloudScopes] HTTP \(http.statusCode) — transient")
+                return .transientError
+            }
+        } catch is CancellationError {
+            // Structured-concurrency contract: cancellation must propagate, never be
+            // swallowed as a "transient" outcome. Otherwise a cancelled probe could
+            // let switchAccount() proceed with an unverified token (DeepSeek finding #1).
+            throw CancellationError()
+        } catch {
+            log.warning("[probeCloudScopes] error: \(error.localizedDescription) — transient")
+            return .transientError
+        }
+    }
+
     // MARK: - Account Switching
 
     func switchAccount(from currentAccount: Account, to targetAccount: Account) async throws {
@@ -207,6 +270,30 @@ final class ClaudeService: Sendable {
         let targetEmail = (targetBackup.oauthAccount["emailAddress"]?.value as? String) ?? "?"
         log.info("[switchAccount] Step 2: Target backup found (email=\(targetEmail))")
 
+        // 2.5. Probe target token's cloud-feature scopes BEFORE writing to keychain.
+        // OAuth 2.0 cannot upgrade scopes via refresh_token — a token minted before
+        // a new scope existed will silently fail Claude Code's cloud features
+        // (e.g. /ultraplan returns "session creation failed"). On stale-scope, halt
+        // the swap so the user re-authenticates instead of writing a broken token.
+        // See AppState.reauthenticateAccount; UI is in AccountSwitcherView.swift:141.
+        log.info("[switchAccount] Step 2.5: Probing target token cloud scopes...")
+        if let probeAccessToken = ClaudeService.extractAccessToken(from: targetBackup.token) {
+            // `try` lets CancellationError propagate up; AppState.switchTo catches it
+            // and surfaces a clean error to the user instead of silently corrupting
+            // the live keychain entry with an unverified token.
+            switch try await probeCloudScopes(accessToken: probeAccessToken) {
+            case .ok:
+                log.info("[switchAccount] Step 2.5: cloud scopes OK")
+            case .staleScope:
+                log.error("[switchAccount] Step 2.5: stale-scope — halting swap before keychain write")
+                throw ClaudeServiceError.staleScope(email: targetAccount.email)
+            case .transientError:
+                log.warning("[switchAccount] Step 2.5: probe inconclusive — proceeding (fail-open)")
+            }
+        } else {
+            log.warning("[switchAccount] Step 2.5: could not extract accessToken from backup, skipping probe")
+        }
+
         // 3. Write target token to keychain + target oauthAccount to ~/.claude.json
         log.info("[switchAccount] Step 3: Writing target credentials...")
         guard keychain.writeClaudeToken(targetBackup.token) else {
@@ -219,18 +306,30 @@ final class ClaudeService: Sendable {
         }
         log.info("[switchAccount] Step 3: Both token and oauthAccount written")
 
-        // 4. Verify
-        log.info("[switchAccount] Step 4: Verifying with `claude auth status`...")
-        let status = try await getAuthStatus()
-        guard status.loggedIn else {
-            log.error("[switchAccount] Step 4: Not logged in after switch!")
+        // 4. Verify identity from ~/.claude.json (the file we just wrote in Step 3).
+        // We read it back directly — no subprocess needed. `claude auth status` can
+        // hang for 12+ seconds on expired tokens (internal refresh deadlock, exit 1)
+        // and is no longer the canonical identity source since v2.1.139.
+        log.info("[switchAccount] Step 4: Verifying identity from oauthAccount...")
+        guard let identity = KeychainService.shared.readOAuthIdentity() else {
+            log.error("[switchAccount] Step 4: Could not read oauthAccount identity after write")
             throw ClaudeServiceError.switchVerificationFailed
         }
-        if status.email != targetAccount.email {
-            log.error("[switchAccount] Step 4: Logged in as \(status.email ?? "nil") instead of \(targetAccount.email)")
-            throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: status.email ?? "unknown")
+        if identity.emailAddress != targetAccount.email {
+            log.error("[switchAccount] Step 4: Identity mismatch — got \(identity.emailAddress), expected \(targetAccount.email)")
+            throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: identity.emailAddress)
         }
-        log.info("[switchAccount] Step 4: Switch verified — logged in as \(status.email ?? "")")
+        // Secondary: best-effort auth status check — warn on failure, never throw.
+        // This lets us detect edge cases (e.g. keychain desync) without blocking switches.
+        do {
+            let status = try await getAuthStatus()
+            if !status.loggedIn {
+                log.warning("[switchAccount] Step 4: Secondary check — claude reports not logged in despite correct identity")
+            }
+        } catch {
+            log.warning("[switchAccount] Step 4: Secondary auth-status check failed (non-fatal): \(error.localizedDescription)")
+        }
+        log.info("[switchAccount] Step 4: Switch verified — logged in as \(identity.emailAddress)")
     }
 
     /// Capture the current Claude auth token + oauthAccount and associate with an account
@@ -341,6 +440,7 @@ enum ClaudeServiceError: LocalizedError {
     case oauthAccountWriteFailed
     case switchVerificationFailed
     case switchWrongAccount(expected: String, actual: String)
+    case staleScope(email: String)
 
     var errorDescription: String? {
         switch self {
@@ -360,6 +460,8 @@ enum ClaudeServiceError: LocalizedError {
             return "Account switch verification failed"
         case .switchWrongAccount(let expected, let actual):
             return "Switch failed: expected \(expected) but got \(actual). Try removing and re-adding the account."
+        case .staleScope(let email):
+            return "\(email)'s saved token is too old for cloud features (e.g. /ultraplan). Click \"Re-authenticate\" on this account to fix."
         }
     }
 }

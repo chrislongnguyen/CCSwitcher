@@ -43,6 +43,12 @@ final class AppState: ObservableObject {
     private let accountsKey = "com.ccswitcher.accounts"
     private var refreshTimer: Timer?
 
+    /// Reentrancy guard for switchTo. Distinct from `isLoading` (which is also set
+    /// by `refresh()` running in parallel) so that auto-refresh doesn't silently
+    /// swallow account-switch clicks. Not @Published — UI doesn't observe it.
+    /// DeepSeek v2 finding #1.
+    private var isSwitching = false
+
     // MARK: - Initialization
 
     init() {
@@ -126,12 +132,18 @@ final class AppState: ObservableObject {
 
         do {
             let status = try await claudeService.getAuthStatus()
-            guard status.loggedIn, let email = status.email else {
+            guard status.loggedIn else {
                 errorMessage = String(localized: "Not logged in to Claude. Run 'claude auth login' first.", bundle: L10n.bundle)
                 log.error("[addAccount] Aborted: not logged in")
                 return
             }
-            log.info("[addAccount] Current auth: logged in, sub=\(status.subscriptionType ?? "nil")")
+            guard let identity = keychain.readOAuthIdentity() else {
+                errorMessage = String(localized: "Could not read account identity from ~/.claude.json", bundle: L10n.bundle)
+                log.error("[addAccount] Aborted: no oauthAccount identity")
+                return
+            }
+            let email = identity.emailAddress
+            log.info("[addAccount] Current auth: logged in, sub=\(identity.subscriptionTypeLabel ?? "nil")")
 
             if accounts.contains(where: { $0.email == email }) {
                 errorMessage = String(localized: "Account already exists", bundle: L10n.bundle)
@@ -141,10 +153,10 @@ final class AppState: ObservableObject {
 
             var account = Account(
                 email: email,
-                displayName: status.orgName ?? email,
+                displayName: identity.organizationName ?? email,
                 provider: .claudeCode,
-                orgName: status.orgName,
-                subscriptionType: status.subscriptionType,
+                orgName: identity.organizationName,
+                subscriptionType: identity.subscriptionTypeLabel,
                 isActive: accounts.isEmpty
             )
             log.info("[addAccount] Created account model, id=\(account.id)")
@@ -202,12 +214,19 @@ final class AppState: ObservableObject {
             // 3. Read the new identity from ~/.claude.json
             log.info("[loginNewAccount] Step 3: Reading post-login state...")
             let status = try await claudeService.getAuthStatus()
-            guard status.loggedIn, let email = status.email else {
+            guard status.loggedIn else {
                 errorMessage = String(localized: "Login did not complete", bundle: L10n.bundle)
                 log.error("[loginNewAccount] Step 3: Not logged in after login!")
                 isLoggingIn = false
                 return
             }
+            guard let identity = keychain.readOAuthIdentity() else {
+                errorMessage = String(localized: "Could not read account identity after login", bundle: L10n.bundle)
+                log.error("[loginNewAccount] Step 3: No oauthAccount identity after login")
+                isLoggingIn = false
+                return
+            }
+            let email = identity.emailAddress
             log.info("[loginNewAccount] Step 3: Logged in as \(email)")
 
             // 4. Check for duplicate — if exists, just refresh its backup
@@ -222,10 +241,10 @@ final class AppState: ObservableObject {
             // 5. Create new account and capture credentials (token + oauthAccount)
             let account = Account(
                 email: email,
-                displayName: status.orgName ?? email,
+                displayName: identity.organizationName ?? email,
                 provider: .claudeCode,
-                orgName: status.orgName,
-                subscriptionType: status.subscriptionType,
+                orgName: identity.organizationName,
+                subscriptionType: identity.subscriptionTypeLabel,
                 isActive: true
             )
             log.info("[loginNewAccount] Step 5: Created account, id=\(account.id)")
@@ -284,6 +303,14 @@ final class AppState: ObservableObject {
     }
 
     func switchTo(_ account: Account) async {
+        // Reentrancy guard via the dedicated `isSwitching` flag (not `isLoading`,
+        // which is also set by auto-refresh running every 5min). Using the shared
+        // flag would silently drop user clicks during refresh's ~5s window.
+        // DeepSeek v2 findings #1 and #3.
+        guard !isSwitching else {
+            log.info("[switchTo] Skipping: a switch is already in progress")
+            return
+        }
         guard let currentActive = activeAccount, currentActive.id != account.id else {
             log.info("[switchTo] No switch needed (same account or no active account)")
             return
@@ -298,6 +325,8 @@ final class AppState: ObservableObject {
             return
         }
 
+        isSwitching = true
+        defer { isSwitching = false }   // structurally guarantees clear on every exit path
         isLoading = true
         do {
             try await claudeService.switchAccount(from: currentActive, to: account)
@@ -313,10 +342,26 @@ final class AppState: ObservableObject {
 
             await refresh()
             log.info("[switchTo] ===== Switch completed =====")
+        } catch is CancellationError {
+            log.warning("[switchTo] Switch cancelled")
+            // Task was cancelled — not an error the user needs to see
         } catch {
             errorMessage = error.localizedDescription
             isLoading = false
             log.error("[switchTo] Switch failed: \(error.localizedDescription)")
+
+            // Best-effort keychain rollback after any partial-write failure (e.g.
+            // Step 4 verify fails, leaving the live keychain holding a broken token).
+            // Without this, the user can be left effectively logged out of Claude Code
+            // until they manually re-auth. DeepSeek v2 finding #2.
+            // Safe under all error cases: if Step 1 didn't back up the source, the
+            // get returns nil and we no-op. staleScope throws BEFORE any write so
+            // restoring the source token is a no-op write of identical data.
+            if let backup = keychain.getAccountBackup(forAccountId: currentActive.id.uuidString) {
+                _ = keychain.writeClaudeToken(backup.token)
+                _ = keychain.writeOAuthAccount(backup.oauthAccount)
+                log.warning("[switchTo] Restored keychain to source account (\(currentActive.email)) after switch failure")
+            }
         }
     }
 
@@ -344,11 +389,17 @@ final class AppState: ObservableObject {
 
             // 3. Verify the login result matches the target account
             let status = try await claudeService.getAuthStatus()
-            guard status.loggedIn, let email = status.email else {
+            guard status.loggedIn else {
                 errorMessage = String(localized: "Login did not complete", bundle: L10n.bundle)
                 isLoggingIn = false
                 return
             }
+            guard let identity = keychain.readOAuthIdentity() else {
+                errorMessage = String(localized: "Could not read account identity after login", bundle: L10n.bundle)
+                isLoggingIn = false
+                return
+            }
+            let email = identity.emailAddress
 
             guard email == account.email else {
                 errorMessage = String(localized: "Logged in as \(email), but expected \(account.email). Credentials not updated.", bundle: L10n.bundle)
@@ -363,8 +414,8 @@ final class AppState: ObservableObject {
 
             // 5. Update account metadata
             if let index = accounts.firstIndex(where: { $0.id == account.id }) {
-                accounts[index].orgName = status.orgName
-                accounts[index].subscriptionType = status.subscriptionType
+                accounts[index].orgName = identity.organizationName
+                accounts[index].subscriptionType = identity.subscriptionTypeLabel
 
                 // Mark this account as active (it's what the CLI is now using)
                 for i in accounts.indices {
@@ -534,24 +585,29 @@ final class AppState: ObservableObject {
     }
 
     private func updateActiveAccount(from status: AuthStatus) {
-        guard status.loggedIn, let email = status.email else { return }
+        guard status.loggedIn else { return }
+        guard let identity = keychain.readOAuthIdentity() else {
+            log.warning("[updateActiveAccount] No oauthAccount identity in ~/.claude.json")
+            return
+        }
+        let email = identity.emailAddress
 
         if let index = accounts.firstIndex(where: { $0.email == email }) {
             for i in accounts.indices {
                 accounts[i].isActive = (i == index)
             }
-            accounts[index].orgName = status.orgName
-            accounts[index].subscriptionType = status.subscriptionType
+            accounts[index].orgName = identity.organizationName
+            accounts[index].subscriptionType = identity.subscriptionTypeLabel
             activeAccount = accounts[index]
             saveAccounts()
             log.info("[updateActiveAccount] Matched existing account at index \(index)")
         } else if accounts.isEmpty {
             let account = Account(
                 email: email,
-                displayName: status.orgName ?? email,
+                displayName: identity.organizationName ?? email,
                 provider: .claudeCode,
-                orgName: status.orgName,
-                subscriptionType: status.subscriptionType,
+                orgName: identity.organizationName,
+                subscriptionType: identity.subscriptionTypeLabel,
                 isActive: true
             )
             accounts.append(account)
