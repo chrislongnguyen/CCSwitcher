@@ -186,6 +186,10 @@ final class ClaudeService: Sendable {
         /// Token authenticates but lacks the scopes for cloud features.
         /// Re-authentication is required (refresh_token cannot upgrade scopes per OAuth 2.0).
         case staleScope
+        /// Server rejected the token (401). Refresh token expired or was rotated/revoked
+        /// while this snapshot was sitting in CCSwitcher's backup. Re-auth required;
+        /// proceeding would corrupt the live keychain with a token the API will refuse.
+        case expired
         /// Network or transient error. Caller should fall through, not block.
         case transientError
     }
@@ -214,6 +218,13 @@ final class ClaudeService: Sendable {
             case 200:
                 log.info("[probeCloudScopes] HTTP 200 — cloud scopes present")
                 return .ok
+            case 401:
+                // Server rejected the bearer. The snapshot CCSwitcher is about to write
+                // is already invalid — writing it would leave Claude Code in the 401
+                // loop the user is currently seeing. Halt and route to re-auth.
+                let body = String(data: data, encoding: .utf8) ?? ""
+                log.error("[probeCloudScopes] HTTP 401 — token expired/revoked. body=\(body.prefix(200))")
+                return .expired
             case 403:
                 let body = String(data: data, encoding: .utf8) ?? ""
                 if body.contains("OAuth token does not meet scope requirement") {
@@ -287,6 +298,9 @@ final class ClaudeService: Sendable {
             case .staleScope:
                 log.error("[switchAccount] Step 2.5: stale-scope — halting swap before keychain write")
                 throw ClaudeServiceError.staleScope(email: targetAccount.email)
+            case .expired:
+                log.error("[switchAccount] Step 2.5: token expired/revoked — halting swap before keychain write")
+                throw ClaudeServiceError.expiredToken(email: targetAccount.email)
             case .transientError:
                 log.warning("[switchAccount] Step 2.5: probe inconclusive — proceeding (fail-open)")
             }
@@ -441,6 +455,7 @@ enum ClaudeServiceError: LocalizedError {
     case switchVerificationFailed
     case switchWrongAccount(expected: String, actual: String)
     case staleScope(email: String)
+    case expiredToken(email: String)
 
     var errorDescription: String? {
         switch self {
@@ -462,6 +477,8 @@ enum ClaudeServiceError: LocalizedError {
             return "Switch failed: expected \(expected) but got \(actual). Try removing and re-adding the account."
         case .staleScope(let email):
             return "\(email)'s saved token is too old for cloud features (e.g. /ultraplan). Click \"Re-authenticate\" on this account to fix."
+        case .expiredToken(let email):
+            return "\(email)'s saved token has expired (refresh token rotated or revoked since last capture). Click \"Re-authenticate\" on this account to fix — no terminal /login needed."
         }
     }
 }

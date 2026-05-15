@@ -345,24 +345,45 @@ final class AppState: ObservableObject {
         } catch is CancellationError {
             log.warning("[switchTo] Switch cancelled")
             // Task was cancelled — not an error the user needs to see
+        } catch let svcErr as ClaudeServiceError {
+            // For probe-detected expired/stale-scope errors, mark the target account
+            // as expired so the UI immediately surfaces the "Stale token" badge and
+            // the prominent "Re-authenticate" CTA on its row. Without this, the user
+            // sees only the errorMessage banner and the misleading "Switch" button stays.
+            switch svcErr {
+            case .expiredToken, .staleScope:
+                accountUsageErrors[account.id] = UsageErrorState(
+                    isExpired: true,
+                    isRateLimited: false,
+                    message: svcErr.errorDescription ?? "Token expired"
+                )
+            default:
+                break
+            }
+            errorMessage = svcErr.localizedDescription
+            isLoading = false
+            log.error("[switchTo] Switch failed: \(svcErr.localizedDescription)")
+            rollbackKeychain(to: currentActive)
         } catch {
             errorMessage = error.localizedDescription
             isLoading = false
             log.error("[switchTo] Switch failed: \(error.localizedDescription)")
-
-            // Best-effort keychain rollback after any partial-write failure (e.g.
-            // Step 4 verify fails, leaving the live keychain holding a broken token).
-            // Without this, the user can be left effectively logged out of Claude Code
-            // until they manually re-auth. DeepSeek v2 finding #2.
-            // Safe under all error cases: if Step 1 didn't back up the source, the
-            // get returns nil and we no-op. staleScope throws BEFORE any write so
-            // restoring the source token is a no-op write of identical data.
-            if let backup = keychain.getAccountBackup(forAccountId: currentActive.id.uuidString) {
-                _ = keychain.writeClaudeToken(backup.token)
-                _ = keychain.writeOAuthAccount(backup.oauthAccount)
-                log.warning("[switchTo] Restored keychain to source account (\(currentActive.email)) after switch failure")
-            }
+            rollbackKeychain(to: currentActive)
         }
+    }
+
+    /// Best-effort keychain rollback after any partial-write failure (e.g.
+    /// Step 4 verify fails, leaving the live keychain holding a broken token).
+    /// Without this, the user can be left effectively logged out of Claude Code
+    /// until they manually re-auth. DeepSeek v2 finding #2.
+    /// Safe under all error cases: if Step 1 didn't back up the source, the
+    /// get returns nil and we no-op. staleScope/expiredToken throw BEFORE any
+    /// write so restoring the source token is a no-op write of identical data.
+    private func rollbackKeychain(to sourceAccount: Account) {
+        guard let backup = keychain.getAccountBackup(forAccountId: sourceAccount.id.uuidString) else { return }
+        _ = keychain.writeClaudeToken(backup.token)
+        _ = keychain.writeOAuthAccount(backup.oauthAccount)
+        log.warning("[switchTo] Restored keychain to source account (\(sourceAccount.email)) after switch failure")
     }
 
     /// Re-authenticate an account by running `claude auth login` and capturing fresh credentials.
