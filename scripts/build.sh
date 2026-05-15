@@ -101,8 +101,16 @@ case "$CONFIGURATION" in
     *) die "Unknown configuration: $CONFIGURATION (use debug or release)" ;;
 esac
 
-say "Building $CONFIG_TITLECASE into $BUILD_DIR/..."
-rm -rf "$BUILD_DIR"
+# Two-stage build:
+#  Stage 1: xcodebuild with CODE_SIGNING_ALLOWED=NO — produces unsigned .app.
+#           This sidesteps Apple's portal registration of `me.xueshi.ccswitcher`
+#           (which is locked to xueshi's team 584KQTRF3B; Long's Personal Team
+#           cannot register it via automatic signing).
+#  Stage 2: codesign --sign "Apple Development: ..." with the entitlements files.
+#           This is how yesterday's working build was signed (verified: the
+#           installed app has Authority=Apple Development, TeamIdentifier=6QF32QTRVD,
+#           and NO embedded.provisionprofile — i.e. post-build codesign).
+say "Stage 1: Building $CONFIG_TITLECASE unsigned into $BUILD_DIR/..."
 BUILD_LOG="$BUILD_DIR/xcodebuild.log"
 mkdir -p "$BUILD_DIR"
 set +e
@@ -111,9 +119,9 @@ xcodebuild \
     -scheme CCSwitcher \
     -configuration "$CONFIG_TITLECASE" \
     -derivedDataPath "$BUILD_DIR" \
-    DEVELOPMENT_TEAM="$EXPECTED_TEAM" \
-    CODE_SIGN_STYLE=Automatic \
-    -allowProvisioningUpdates \
+    CODE_SIGNING_ALLOWED=NO \
+    CODE_SIGNING_REQUIRED=NO \
+    CODE_SIGN_IDENTITY="" \
     build > "$BUILD_LOG" 2>&1
 BUILD_STATUS=$?
 set -e
@@ -127,10 +135,29 @@ grep -E "^(error|warning):" "$BUILD_LOG" | head -10 || true
 BUILT_APP="$BUILD_DIR/Build/Products/$CONFIG_TITLECASE/CCSwitcher.app"
 [ -d "$BUILT_APP" ] || die "Build produced no .app at $BUILT_APP — check $BUILD_LOG"
 
+# Stage 2: Sign with a real Apple Development cert from this Mac's keychain.
+say "Stage 2: Signing with Apple Development cert (team $EXPECTED_TEAM)..."
+SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk '/Apple Development/{print $2; exit}')
+[ -n "$SIGN_IDENTITY" ] || die "No Apple Development codesigning identity found in keychain"
+
+APP_ENT="CCSwitcher/Resources/CCSwitcher.entitlements"
+WIDGET_ENT="CCSwitcherWidget/Resources/CCSwitcherWidget.entitlements"
+[ -f "$APP_ENT" ] || die "App entitlements not found at $APP_ENT"
+[ -f "$WIDGET_ENT" ] || die "Widget entitlements not found at $WIDGET_ENT"
+
+WIDGET_APPEX="$BUILT_APP/Contents/PlugIns/CCSwitcherWidgetExtension.appex"
+if [ -d "$WIDGET_APPEX" ]; then
+    codesign --force --sign "$SIGN_IDENTITY" --entitlements "$WIDGET_ENT" \
+        --options runtime --timestamp=none "$WIDGET_APPEX"
+fi
+codesign --force --sign "$SIGN_IDENTITY" --entitlements "$APP_ENT" \
+    --options runtime --timestamp=none --deep "$BUILT_APP"
+
 # --- Verify the built binary's signature is NOT ad-hoc ---
 
 say "Verifying built signature..."
-SIGINFO=$(codesign -dv "$BUILT_APP" 2>&1)
+SIGINFO=$(codesign -dvv "$BUILT_APP" 2>&1)
 echo "$SIGINFO"
 
 # Must have an Authority chain (not adhoc)
@@ -145,7 +172,7 @@ if ! echo "$SIGINFO" | grep -q "TeamIdentifier=$EXPECTED_TEAM"; then
 fi
 
 # Bundle ID must match
-ACTUAL_BUNDLE_ID=$(defaults read "$BUILT_APP/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || echo "")
+ACTUAL_BUNDLE_ID=$(plutil -extract CFBundleIdentifier raw "$BUILT_APP/Contents/Info.plist" 2>/dev/null || echo "")
 [ "$ACTUAL_BUNDLE_ID" = "$EXPECTED_BUNDLE_ID" ] || die "Bundle ID drift: built '$ACTUAL_BUNDLE_ID', expected '$EXPECTED_BUNDLE_ID'"
 
 say "Signature OK — TeamIdentifier=$EXPECTED_TEAM, BundleID=$EXPECTED_BUNDLE_ID, not ad-hoc"
