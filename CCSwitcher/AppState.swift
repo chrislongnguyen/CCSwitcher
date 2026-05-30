@@ -91,11 +91,12 @@ final class AppState: ObservableObject {
         recentActivity = statsParser.getRecentActivity(days: 7)
         activeSessions = statsParser.getActiveSessions()
 
-        // Heavy JSONL parsing off main thread
-        let parser = costParser
-        let actParser = activityParser
-        let cost = await Task.detached { parser.getCostSummary() }.value
-        let activity = await Task.detached { actParser.getTodayStats() }.value
+        // JSONL parsing: walk filesystem once via the shared cache, then
+        // pull aggregated outputs. The actor's executor is off the main
+        // thread, so awaiting these does not block the UI.
+        await SessionParseCache.shared.refreshFromFilesystem()
+        let cost = await costParser.getCostSummary()
+        let activity = await activityParser.getTodayStats()
         costSummary = cost
         activityStats = activity
 
