@@ -49,6 +49,12 @@ final class AppState: ObservableObject {
     /// DeepSeek v2 finding #1.
     private var isSwitching = false
 
+    /// Accounts with an in-flight refresh-grant. Because refresh tokens are single-use
+    /// (rotated server-side), two concurrent grants for the same account would make the
+    /// second fail with invalid_grant on a token the first already rotated away. Set on
+    /// the MainActor before each grant, cleared after. Reviewer Finding #2.
+    private var refreshingAccounts: Set<UUID> = []
+
     // MARK: - Initialization
 
     init() {
@@ -82,6 +88,11 @@ final class AppState: ObservableObject {
 
         // Passive token health check (no CLI calls, keychain reads only)
         diagnoseTokenHealth()
+
+        // Proactively refresh any token nearing expiry so the live token stays valid
+        // (keeps usage/cost working) and inactive backups stay switch-ready. Cheap:
+        // only fires a network grant when a token is within SKEW of expiry (~once/8h).
+        await refreshExpiringTokens()
 
         // Fetch usage limits for all accounts
         await fetchAllAccountUsage()
@@ -459,6 +470,63 @@ final class AppState: ObservableObject {
 
     // MARK: - Usage
 
+    /// Proactively refresh stored tokens that are at or near expiry, persisting the
+    /// rotated refresh token each time (ROTATION-SAFETY). Runs every refresh cycle but
+    /// only issues a network grant when `expiresAt` is within SKEW — so at most ~once
+    /// per token lifetime (~8h), never a tight loop. ARCHITECTURE.md §Token Lifecycle.
+    private func refreshExpiringTokens() async {
+        let skewMillis = 10.0 * 60 * 1000   // refresh when within 10 min of expiry
+        let nowMillis = Date().timeIntervalSince1970 * 1000
+        for account in accounts {
+            guard let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString),
+                  let expiresAt = ClaudeService.extractExpiresAt(from: backup.token),
+                  let refreshTok = ClaudeService.extractRefreshToken(from: backup.token) else {
+                continue
+            }
+            guard expiresAt - nowMillis <= skewMillis else { continue }   // still fresh — skip
+            guard !refreshingAccounts.contains(account.id) else { continue }  // grant already in flight
+            refreshingAccounts.insert(account.id)
+            defer { refreshingAccounts.remove(account.id) }
+            do {
+                let creds = try await claudeService.refresher.refresh(refreshToken: refreshTok)
+                let ok = keychain.persistRefreshedCreds(creds, forAccountId: account.id.uuidString, isActive: account.isActive)
+                log.info("[proactiveRefresh] \(account.email): refreshed, persisted=\(ok)")
+            } catch {
+                // Non-fatal: a dead refresh token surfaces as the usual expired-state in
+                // fetchAllAccountUsage / on switch. Don't block the refresh cycle.
+                log.warning("[proactiveRefresh] \(account.email): refresh failed — \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// On a usage 401, mint a fresh access token via direct refresh-grant, persist the
+    /// rotated token (ROTATION-SAFETY), and retry usage ONCE. Returns true on recovery.
+    /// Safe for inactive accounts: persist writes the backup store (keychain only when
+    /// active), so there is no silent live-keychain swap that could race the CLI.
+    private func refreshAndRetryUsage(account: Account) async -> Bool {
+        guard let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString),
+              let refreshTok = ClaudeService.extractRefreshToken(from: backup.token) else {
+            return false
+        }
+        guard !refreshingAccounts.contains(account.id) else { return false }  // grant already in flight
+        refreshingAccounts.insert(account.id)
+        defer { refreshingAccounts.remove(account.id) }
+        do {
+            let creds = try await claudeService.refresher.refresh(refreshToken: refreshTok)
+            guard keychain.persistRefreshedCreds(creds, forAccountId: account.id.uuidString, isActive: account.isActive) else {
+                return false
+            }
+            let usage = try await claudeService.getUsageLimits(accessToken: creds.accessToken)
+            accountUsage[account.id] = usage
+            accountUsageErrors[account.id] = nil
+            log.info("[fetchUsage] Recovered \(account.email) via direct refresh.")
+            return true
+        } catch {
+            log.error("[fetchUsage] Direct refresh failed for \(account.email): \(error.localizedDescription)")
+            return false
+        }
+    }
+
     private func fetchAllAccountUsage() async {
         accountUsageErrors.removeAll()
         // For active account: use live keychain token (with delegated refresh on expiry)
@@ -480,31 +548,14 @@ final class AppState: ObservableObject {
                 accountUsageErrors[account.id] = nil
                 log.info("[fetchUsage] \(account.email): session=\(usage.fiveHour?.utilization ?? -1)%, weekly=\(usage.sevenDay?.utilization ?? -1)%")
             } catch ClaudeService.UsageError.expired {
-                log.warning("[fetchUsage] Token expired for \(account.email)")
-                if account.isActive {
-                    // Active account: delegated refresh via `claude auth status` is safe (no keychain swap)
-                    do {
-                        _ = try await claudeService.getAuthStatus()
-                        log.info("[fetchUsage] Delegated refresh completed for active account.")
-                        // Re-read refreshed token and retry
-                        if let refreshedJSON = keychain.readClaudeToken(),
-                           let refreshedToken = ClaudeService.extractAccessToken(from: refreshedJSON),
-                           let usage = try? await claudeService.getUsageLimits(accessToken: refreshedToken) {
-                            accountUsage[account.id] = usage
-                            accountUsageErrors[account.id] = nil
-                            log.info("[fetchUsage] Recovered \(account.email) via delegated refresh.")
-                        }
-                    } catch {
-                        log.error("[fetchUsage] Delegated refresh failed for active account: \(error.localizedDescription)")
-                        accountUsage[account.id] = nil
-                        accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: String(localized: "Token expired. Switch to refresh.", bundle: L10n.bundle))
-                    }
-                } else {
-                    // Non-active account: do NOT silent-swap keychain — just mark as expired.
-                    // Token will be refreshed when the user explicitly switches to this account.
-                    log.info("[fetchUsage] Non-active account \(account.email) token expired, skipping silent swap to avoid race condition with Claude Code CLI.")
+                // Direct refresh-grant + retry, for BOTH active and inactive accounts.
+                // Persisting to the backup store (and keychain only when active) is safe —
+                // no silent keychain swap for inactive accounts, so no race with the CLI.
+                log.warning("[fetchUsage] Token expired for \(account.email) — attempting direct refresh")
+                let recovered = await refreshAndRetryUsage(account: account)
+                if !recovered {
                     accountUsage[account.id] = nil
-                    accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: String(localized: "Token expired. Switch to this account to refresh.", bundle: L10n.bundle))
+                    accountUsageErrors[account.id] = UsageErrorState(isExpired: true, isRateLimited: false, message: String(localized: "Token expired. Re-authenticate to fix.", bundle: L10n.bundle))
                 }
             } catch {
                 log.error("[fetchUsage] Failed to get usage for \(account.email): \(error.localizedDescription)")

@@ -1,5 +1,129 @@
 # CCSwitcher Architecture
 
+> **AUTHORITATIVE SECTION — added 2026-06-06. Supersedes any conflicting detail below.**
+> Sections after this one (Keychain Token Storage, `security` CLI usage, keychain-backup
+> model) predate the 2026-05-14 file-primary migration and the 2026-06-06 refresh-lifecycle
+> work. Where they conflict with this section, THIS section is current. Stale parts are
+> retained for history, not as a description of current behavior.
+
+---
+
+## Token Lifecycle & Refresh (the load-bearing design)
+
+### The defect this section closes
+
+CCSwitcher switched accounts by **snapshotting** each account's OAuth token to a backup
+store (`~/.ccswitcher/backups.json`) and **replaying** the snapshot on switch. This model
+died ~once per day across ~10 rebuilds (Apr–Jun 2026). Root cause, proven by live spike
+2026-06-06: **Anthropic OAuth refresh tokens ROTATE.** Each successful refresh grant
+invalidates the previous refresh token server-side. The moment the live `claude` CLI
+refreshes an account once, every stored snapshot of that account holds a dead refresh
+token. The backup-and-replay model is therefore **structurally incompatible with token
+rotation** — no rebuild of that model survives past one rotation window.
+
+> Note: CC auto-update was never the killer. Tokens expire on their own 8-hour clock
+> regardless of CLI version. Pinning the CC version (see global `cc-autoupdate-disabled`)
+> does not change token lifecycle. Treating "survives CC update" and "survives token
+> expiry" as the same problem is what masked this root cause for 10 builds.
+
+### Spike results — 2026-06-06 (verbatim, falsifiable signals)
+
+Probes run locally, read-only, redacted. Endpoint, client_id, request shape, rotation
+behavior all confirmed against the LIVE Anthropic OAuth service.
+
+| # | Hypothesis | Verdict | Absolute signal |
+|---|---|---|---|
+| H1 | endpoint `platform.claude.com/v1/oauth/token` + client_id + JSON shape correct | ✅ VALIDATED | server returned structured `invalid_grant`, NOT `invalid_client` → request fully processed |
+| H2 | stored backup refresh tokens still alive | ✗ FALSIFIED | both accounts: `HTTP 400 invalid_grant: "Refresh token not found or invalid"` |
+| H3 | refresh tokens rotate (snapshots rot) | ✅ VALIDATED | live token refresh returned `rotated=True` |
+| H5 | keychain popup = `security` CLI lost the entry's ACL after a rewrite | ✅ then self-resolved | CLI read hung 3s (blocked) → after re-grant, exit=0 free |
+| H6 | Cloudflare WAF block is User-Agent-based | ✅ VALIDATED | plain `urllib` UA → `HTTP 403 error code: 1010`; CLI UA → passes |
+| —  | live keychain token refresh end-to-end | ✅ VALIDATED | `HTTP 200 rotated=True expires_in=28800` (8h) |
+
+**Constants confirmed live:**
+- `TOKEN_ENDPOINT = https://platform.claude.com/v1/oauth/token` (legacy alias `console.anthropic.com/v1/oauth/token` exists; not used)
+- `CLIENT_ID = 9d1c250a-e61b-44d9-88ed-5944d1962f5e` (public PKCE client; no client_secret)
+- Required headers to clear Cloudflare 1010: `User-Agent: claude-cli/<ver> (external, cli)`, `anthropic-beta: oauth-2025-04-20`, `Content-Type: application/json`
+- Request body: `{"grant_type":"refresh_token","refresh_token":"<rt>","client_id":"<CLIENT_ID>"}`
+- Response: `{access_token, refresh_token (ROTATED — must persist), expires_in: 28800, token_type, scope}`
+
+### Option A — Direct refresh (CHOSEN, this build)
+
+CCSwitcher refreshes tokens itself via the OAuth endpoint above.
+
+```
+SWITCH(target):
+  1. back up current account (token + oauthAccount)        [unchanged]
+  2. read target backup                                    [unchanged]
+  2.5 probe target accessToken (probeCloudScopes)          [unchanged]
+        .ok        -> proceed to write
+        .staleScope-> halt, re-auth (scope upgrade needs browser; unchanged)
+        .expired   -> *** NEW: attempt refreshGrant(target.refreshToken) ***
+                        success -> WRITE-BACK rotated creds to backup store
+                                   (atomic; chmod 600) THEN proceed with fresh token
+                        failure (invalid_grant) -> halt, re-auth (genuinely dead)
+        .transient -> proceed fail-open                    [unchanged]
+  3. write token + oauthAccount to keychain / ~/.claude.json [unchanged]
+  4. verify identity                                        [unchanged]
+
+PROACTIVE (in AppState.refresh() periodic loop, BEFORE getUsageLimits):
+  for the ACTIVE account whose token expiresAt < now + SKEW (e.g. 10 min):
+     refreshGrant(refreshToken) -> WRITE-BACK rotated creds to keychain + backup
+  for each INACTIVE account same condition -> WRITE-BACK to backup store
+  This keeps the live token fresh so getUsageLimits/cost NEVER hit the stale-token
+  failure (the "API Rate Limited"/empty-usage symptom), and keeps inactive backups
+  alive so a switch rarely hits the .expired path.
+
+REACTIVE (getUsageLimits .expired / HTTP 401):
+  refreshGrant(activeRefreshToken) -> WRITE-BACK -> retry getUsageLimits ONCE.
+  Same TokenRefresher as the switch path. Usage failure is a stale-token symptom,
+  not a separate bug — so it shares the same fix.
+```
+
+**The non-negotiable invariant (the bug that kills every naive build):**
+`refresh_token` is **single-use**. On every `HTTP 200`, the response's NEW `refresh_token`
+MUST be written back to the backup store (and, for the active account, the keychain)
+atomically, BEFORE the old one is discarded. A refresh that succeeds but fails to persist
+the rotated token has *consumed and lost* the only valid credential → next refresh fails.
+Write-back failure must roll back / re-fetch, never silently drop.
+
+**Known dependencies (NOT deterministic / NOT "never fails"):** client_id validity,
+endpoint stability, Cloudflare accepting the CLI UA (already tightening — 1010 is the
+warning shot), and the refresh grant remaining open to public clients (no attestation).
+All are undocumented, Anthropic-controlled surfaces that can change with zero notice.
+Option A converts "fails every day on a fixed clock" → "fails only if Anthropic changes
+OAuth internals." That is robust, not invulnerable.
+
+**Seeding:** the two currently-stored accounts hold dead refresh tokens (H2). Each needs
+ONE manual re-auth to seed a fresh token; proactive refresh keeps them alive thereafter.
+
+### Option B — Delegate to `claude auth status` (DEFERRED — future fallback)
+
+Upstream `XueshiQiao/CCSwitcher` deliberately refuses direct POST. Instead: on `401`,
+spawn `claude auth status` as a background subprocess; the official CLI performs the
+refresh using its own (possibly attested) client; CCSwitcher re-reads the keychain after.
+
+| | Option A (chosen) | Option B (deferred) |
+|---|---|---|
+| Speed | fast, in-process | slower (subprocess spawn) |
+| Durability vs Anthropic OAuth changes | breaks if attestation/client_id/endpoint changes | survives — rides the official client |
+| Complexity | refresh + write-back + rotation handling | subprocess orchestration + keychain re-read |
+
+**Revisit trigger:** if Option A starts returning `403 1010` (TLS/JA3 attestation) or
+`invalid_client` on a known-good token, switch the refresh strategy to Option B. The
+switch flow (steps 1–4) is unchanged; only the `.expired` recovery action swaps from
+`refreshGrant()` to `triggerCliRefresh()`. Architect the refresh call behind a small
+`TokenRefresher` protocol so A↔B is a one-implementation swap, not a rewrite.
+
+### Features that MUST NOT regress (verified working pre-build 2026-06-06)
+
+- **Usage** (`getUsageLimits` → `api.anthropic.com/api/oauth/usage`) — renders session/weekly %. NB: the "API Rate Limited" / failed-usage state observed 2026-06-06 is downstream of the **stale token** (the app holds no fresh token), NOT a real upstream rate limit. Once the active token is refreshed and live, usage resolves. This is part of the same root cause — a symptom of the dead-token model, not a separate feature bug.
+- **Costs** (`SessionParseCache` + `CostParser`) — today / 7d / 30d / daily history.
+- **Activity** (`StatsParser`) — turns / active time / lines / per-model token split.
+- **JSONL parse cache** (`SessionParseCache`, commit `d7aaf8f`) — mtime-keyed; fixed the 100% idle-CPU bug. Refresh work must not bypass or thrash this cache.
+
+---
+
 ## Keychain Token Storage
 
 CCSwitcher manages two sets of keychain entries:

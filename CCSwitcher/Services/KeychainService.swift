@@ -47,9 +47,9 @@ struct AnyCodable: Codable, Equatable {
 }
 
 /// Manages token + identity storage:
-/// - Claude CLI's token: read/write via `security` CLI (keychain).
+/// - Claude CLI's token: file-primary (live-token.txt), keychain fallback via Security framework.
 /// - Claude CLI's identity: read/write oauthAccount in ~/.claude.json.
-/// - Our backups: per-account {token, oauthAccount} in ~/.ccswitcher/backups.json.
+/// - Our backups: per-account {token, oauthAccount} in ~/.ccswitcher/backups.json (file, no keychain ACL).
 final class KeychainService: Sendable {
     static let shared = KeychainService()
 
@@ -128,6 +128,7 @@ final class KeychainService: Sendable {
 
         let sanitized = token.trimmingCharacters(in: .whitespacesAndNewlines)
         log.info("[readClaudeToken] Found via keychain, length=\(sanitized.count)")
+        _ = saveTokenToFile(sanitized) // seed file so next read skips keychain entirely
         return sanitized
     }
 
@@ -287,80 +288,91 @@ final class KeychainService: Sendable {
         return getAccountBackup(forAccountId: accountId)?.token
     }
 
-    // MARK: - App Keychain operations (Backups)
-
-    private let appBackupService = "me.xueshi.ccswitcher.backups"
-    private let appBackupAccount = "all-accounts"
+    // MARK: - Backup Store (file-based — survives rebuilds and CC auto-updates)
 
     private func loadBackupStore() -> [String: AccountBackup] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: appBackupService,
-            kSecAttrAccount as String: appBackupAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        
-        if status == errSecSuccess, let data = item as? Data,
-           let dict = try? JSONDecoder().decode([String: AccountBackup].self, from: data) {
-            log.debug("[loadBackupStore] Loaded \(dict.count) entries from Keychain")
-            return dict
+        guard FileManager.default.fileExists(atPath: backupsFilePath),
+              let data = FileManager.default.contents(atPath: backupsFilePath),
+              let dict = try? JSONDecoder().decode([String: AccountBackup].self, from: data) else {
+            log.debug("[loadBackupStore] No existing backups at \(backupsFilePath)")
+            return [:]
         }
-        
-        // Migration from local file
-        if FileManager.default.fileExists(atPath: backupsFilePath),
-           let data = FileManager.default.contents(atPath: backupsFilePath),
-           let dict = try? JSONDecoder().decode([String: AccountBackup].self, from: data) {
-            log.info("[loadBackupStore] Migrating from local backups.json to Keychain...")
-            // Save to keychain now (call saveBackupStore synchronously)
-            _ = saveBackupStore(dict)
-            // Delete old file
-            try? FileManager.default.removeItem(atPath: backupsFilePath)
-            log.info("[loadBackupStore] Migration complete, local backups.json removed")
-            return dict
-        }
-        
-        log.debug("[loadBackupStore] No existing backups, returning empty")
-        return [:]
+        log.debug("[loadBackupStore] Loaded \(dict.count) entries from file")
+        return dict
     }
 
     private func saveBackupStore(_ store: [String: AccountBackup]) -> Bool {
         do {
-            let encoder = JSONEncoder()
-            let data = try encoder.encode(store)
-            
-            let query: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: appBackupService,
-                kSecAttrAccount as String: appBackupAccount
-            ]
-            
-            let attributes: [String: Any] = [
-                kSecValueData as String: data
-            ]
-            
-            var status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-            
-            if status == errSecItemNotFound {
-                var newItem = query
-                newItem[kSecValueData as String] = data
-                status = SecItemAdd(newItem as CFDictionary, nil)
-            }
-            
-            let success = status == errSecSuccess
-            if success {
-                log.debug("[saveBackupStore] Saved \(store.count) entries to Keychain")
-            } else {
-                log.error("[saveBackupStore] Failed to save to Keychain, OSStatus: \(status)")
-            }
-            return success
+            let data = try JSONEncoder().encode(store)
+            try data.write(to: URL(fileURLWithPath: backupsFilePath), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backupsFilePath)
+            log.debug("[saveBackupStore] Saved \(store.count) entries to file")
+            return true
         } catch {
-            log.error("[saveBackupStore] Failed: \(error.localizedDescription)")
+            log.error("[saveBackupStore] Failed to write \(backupsFilePath): \(error.localizedDescription)")
             return false
         }
+    }
+
+    // MARK: - Refreshed-credential persistence (rotation-safe)
+
+    /// Merge rotated creds into a token-JSON string, PRESERVING every other field
+    /// (mcpOAuth, claudeAiOauth.scopes / subscriptionType / rateLimitTier). Returns the
+    /// new JSON string, or nil if the input is not the expected shape.
+    private func mergeRefreshedCreds(into tokenJSON: String, creds: RefreshedCreds) -> String? {
+        guard let data = tokenJSON.data(using: .utf8),
+              var root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            log.error("[mergeRefreshed] token JSON not an object — cannot merge")
+            return nil
+        }
+        var oauth = (root["claudeAiOauth"] as? [String: Any]) ?? [:]
+        oauth["accessToken"] = creds.accessToken
+        oauth["refreshToken"] = creds.refreshToken
+        oauth["expiresAt"] = creds.expiresAtMillis
+        root["claudeAiOauth"] = oauth
+        guard let newData = try? JSONSerialization.data(withJSONObject: root),
+              let newStr = String(data: newData, encoding: .utf8) else {
+            log.error("[mergeRefreshed] re-encode failed")
+            return nil
+        }
+        return newStr
+    }
+
+    /// Atomically persist rotated creds. ROTATION-SAFETY: the new refresh token must
+    /// be written to durable storage BEFORE the caller discards the old one. Always
+    /// updates the per-account backup store; if `isActive`, also syncs the live keychain
+    /// + token file. Returns false on ANY write failure — the caller MUST treat false as
+    /// fatal and NOT proceed as though the refresh succeeded.
+    func persistRefreshedCreds(_ creds: RefreshedCreds, forAccountId accountId: String, isActive: Bool) -> Bool {
+        var store = loadBackupStore()
+        guard let backup = store[accountId] else {
+            log.error("[persistRefreshed] No backup for \(accountId) — cannot persist rotated creds")
+            return false
+        }
+        guard let newToken = mergeRefreshedCreds(into: backup.token, creds: creds) else {
+            return false
+        }
+        store[accountId] = AccountBackup(token: newToken, oauthAccount: backup.oauthAccount)
+
+        // ORDERING (rotation-safety, reviewer Finding #1): for the ACTIVE account the
+        // live keychain is what the running `claude` CLI reads. Write it FIRST so that a
+        // partial failure leaves the STILL-OLD backup intact (recoverable on next switch)
+        // rather than a backup-holds-new / keychain-holds-dead split where the CLI is stuck
+        // on a server-invalidated token and the fresh-looking backup suppresses retry.
+        if isActive {
+            guard writeClaudeToken(newToken) else {
+                log.error("[persistRefreshed] Active keychain write failed for \(accountId) — backup left unchanged (recoverable)")
+                return false
+            }
+        }
+        guard saveBackupStore(store) else {
+            // Active: keychain already holds the fresh token so the CLI works; backup is
+            // stale-but-self-heals on next capture. Inactive: nothing was written live.
+            log.error("[persistRefreshed] Backup store write failed for \(accountId) (active=\(isActive))")
+            return false
+        }
+        log.info("[persistRefreshed] Rotated creds persisted for \(accountId) (active=\(isActive))")
+        return true
     }
 
 }

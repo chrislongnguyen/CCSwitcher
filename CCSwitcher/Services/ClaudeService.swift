@@ -8,6 +8,11 @@ final class ClaudeService: Sendable {
 
     private let claudePath: String
 
+    /// Token-refresh strategy. Option A (direct OAuth grant) by default; swap to an
+    /// Option B implementation here if the edge starts attestation-blocking (HTTP 403
+    /// 1010). See ARCHITECTURE.md §Token Lifecycle & Refresh.
+    let refresher: any TokenRefreshing = DirectTokenRefresher()
+
     private init() {
         let home = NSHomeDirectory()
         let possiblePaths = [
@@ -167,13 +172,31 @@ final class ClaudeService: Sendable {
 
     /// Extract access token string from a token JSON (keychain format)
     static func extractAccessToken(from tokenJSON: String) -> String? {
+        return oauthField(from: tokenJSON, key: "accessToken") as? String
+    }
+
+    /// Extract the refresh token from a token JSON. Needed to drive the refresh grant.
+    static func extractRefreshToken(from tokenJSON: String) -> String? {
+        return oauthField(from: tokenJSON, key: "refreshToken") as? String
+    }
+
+    /// Extract `expiresAt` (epoch ms) from a token JSON. Used to decide proactive refresh.
+    /// Tolerates Int or Double encodings.
+    static func extractExpiresAt(from tokenJSON: String) -> Double? {
+        switch oauthField(from: tokenJSON, key: "expiresAt") {
+        case let d as Double: return d
+        case let i as Int:    return Double(i)
+        default:              return nil
+        }
+    }
+
+    private static func oauthField(from tokenJSON: String, key: String) -> Any? {
         guard let data = tokenJSON.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let accessToken = oauth["accessToken"] as? String else {
+              let oauth = json["claudeAiOauth"] as? [String: Any] else {
             return nil
         }
-        return accessToken
+        return oauth[key]
     }
 
     // MARK: - Cloud-feature scope probe
@@ -281,6 +304,10 @@ final class ClaudeService: Sendable {
         let targetEmail = (targetBackup.oauthAccount["emailAddress"]?.value as? String) ?? "?"
         log.info("[switchAccount] Step 2: Target backup found (email=\(targetEmail))")
 
+        // Token actually written to the keychain in Step 3. Starts as the stored backup
+        // token; if Step 2.5 refreshes an expired token, this is replaced with the fresh one.
+        var workingToken = targetBackup.token
+
         // 2.5. Probe target token's cloud-feature scopes BEFORE writing to keychain.
         // OAuth 2.0 cannot upgrade scopes via refresh_token — a token minted before
         // a new scope existed will silently fail Claude Code's cloud features
@@ -299,8 +326,30 @@ final class ClaudeService: Sendable {
                 log.error("[switchAccount] Step 2.5: stale-scope — halting swap before keychain write")
                 throw ClaudeServiceError.staleScope(email: targetAccount.email)
             case .expired:
-                log.error("[switchAccount] Step 2.5: token expired/revoked — halting swap before keychain write")
-                throw ClaudeServiceError.expiredToken(email: targetAccount.email)
+                // NEW (2026-06-06): instead of halting, attempt a refresh-token grant.
+                // Anthropic refresh tokens rotate, so the access token expiring does NOT
+                // mean the account is dead — the stored refresh token may still mint a
+                // fresh access token. Only halt to re-auth if the refresh itself fails.
+                log.warning("[switchAccount] Step 2.5: access token expired — attempting refresh-grant")
+                guard let refreshTok = ClaudeService.extractRefreshToken(from: workingToken) else {
+                    log.error("[switchAccount] Step 2.5: no refresh token in backup — re-auth required")
+                    throw ClaudeServiceError.expiredToken(email: targetAccount.email)
+                }
+                do {
+                    let creds = try await refresher.refresh(refreshToken: refreshTok)
+                    // ROTATION-SAFETY: persist the rotated token to the backup store BEFORE
+                    // using it. isActive:false — target is not the live account until Step 3.
+                    guard keychain.persistRefreshedCreds(creds, forAccountId: targetAccount.id.uuidString, isActive: false),
+                          let refreshed = keychain.getAccountBackup(forAccountId: targetAccount.id.uuidString) else {
+                        log.error("[switchAccount] Step 2.5: refresh succeeded but persist/reread failed — re-auth required")
+                        throw ClaudeServiceError.expiredToken(email: targetAccount.email)
+                    }
+                    workingToken = refreshed.token
+                    log.info("[switchAccount] Step 2.5: refresh succeeded — proceeding with fresh token")
+                } catch let refreshErr as TokenRefreshError {
+                    log.error("[switchAccount] Step 2.5: refresh failed (\(refreshErr.localizedDescription)) — re-auth required")
+                    throw ClaudeServiceError.expiredToken(email: targetAccount.email)
+                }
             case .transientError:
                 log.warning("[switchAccount] Step 2.5: probe inconclusive — proceeding (fail-open)")
             }
@@ -310,7 +359,7 @@ final class ClaudeService: Sendable {
 
         // 3. Write target token to keychain + target oauthAccount to ~/.claude.json
         log.info("[switchAccount] Step 3: Writing target credentials...")
-        guard keychain.writeClaudeToken(targetBackup.token) else {
+        guard keychain.writeClaudeToken(workingToken) else {
             log.error("[switchAccount] Step 3: Failed to write token to keychain!")
             throw ClaudeServiceError.keychainWriteFailed
         }
