@@ -67,18 +67,43 @@ SWITCH(target):
   4. verify identity                                        [unchanged]
 
 PROACTIVE (in AppState.refresh() periodic loop, BEFORE getUsageLimits):
-  for the ACTIVE account whose token expiresAt < now + SKEW (e.g. 10 min):
-     refreshGrant(refreshToken) -> WRITE-BACK rotated creds to keychain + backup
-  for each INACTIVE account same condition -> WRITE-BACK to backup store
-  This keeps the live token fresh so getUsageLimits/cost NEVER hit the stale-token
-  failure (the "API Rate Limited"/empty-usage symptom), and keeps inactive backups
-  alive so a switch rarely hits the .expired path.
+  ACTIVE account: NEVER refresh-grant (D2, below). The CC CLI owns the active
+     token and refreshes it on its own clock; the app re-READS the keychain
+     and re-snapshots to backup when it differs (Seeding invariant, below).
+  for each INACTIVE account whose token expiresAt < now + SKEW (e.g. 10 min):
+     refreshGrant(refreshToken) -> WRITE-BACK to backup store
+  This keeps inactive backups alive so a switch rarely hits the .expired path.
 
 REACTIVE (getUsageLimits .expired / HTTP 401):
-  refreshGrant(activeRefreshToken) -> WRITE-BACK -> retry getUsageLimits ONCE.
-  Same TokenRefresher as the switch path. Usage failure is a stale-token symptom,
-  not a separate bug — so it shares the same fix.
+  ACTIVE account: re-read the keychain (the CLI may have already rotated it)
+     and retry ONCE with the re-read token. NEVER refresh-grant (D2).
+  INACTIVE account: refreshGrant(backup.refreshToken) -> WRITE-BACK -> retry ONCE.
 ```
+
+> **SUPERSEDED 2026-06-06 (same-day, post-incident):** the original PROACTIVE/REACTIVE
+> design had the app refresh-granting the ACTIVE account's token too. That is a
+> dual-writer race: refresh tokens are single-use, the CC CLI also rotates the active
+> token, and whichever writer refreshes second gets `invalid_grant` — observed live as
+> CC-session logouts. Replaced by invariant D2.
+
+**Normative invariants (locked 2026-06-06 after live root-cause; see PLAN-20260606-single-source-token.md):**
+
+| # | INVARIANT |
+|---|---|
+| **D1** | **Single source of truth:** the macOS keychain entry is the ONLY copy of the live token. No file mirror. No code path may read or write `~/.ccswitcher/live-token.txt`; startup deletes it if present. All reads go through the app's native, stably-signed Security-framework read (popup-free; the historical popups came from the spawned CLI subprocess via `/usr/bin/security`, not native reads). |
+| **D2** | **One writer per token:** the CC CLI owns the ACTIVE account's token lifecycle (login + rotation). The app refresh-grants ONLY INACTIVE accounts' backup tokens. The app's only writes to the live keychain are the switch path (Step 3) and in-app re-auth. |
+| **D3** | **Write-guarded rollback:** a failed switch may restore the live keychain ONLY if the switch actually wrote it (Step 3 executed). Failures thrown before Step 3 (staleScope / expired / noToken) MUST NOT touch the keychain. After any keychain write, identity is verified before success is reported. |
+
+> **SUPERSEDED 2026-06-06 — the file mirror (`~/.ccswitcher/live-token.txt`):** existed
+> as popup insurance; `readClaudeToken()` preferred it over the keychain. The CLI writes
+> only the keychain (`/login` AND its ~8h self-refresh), so the mirror was stale almost
+> always. Every load-bearing read trusted it. Three observed failures from this one root:
+> (1) backups never re-seeded → proactive refresh flogged dead tokens forever;
+> (2) the seeding self-heal compared stale-mirror vs stale-backup → silent no-op;
+> (3) `rollbackKeychain` after a failed switch wrote a stale backup OVER a fresh
+> CLI login (log 2026-06-06 12:02:56) → repeated CC-session logouts. Its rollback
+> comment claimed "no-op write of identical data" — false whenever the mirror was stale.
+> Killed by D1.
 
 **The non-negotiable invariant (the bug that kills every naive build):**
 `refresh_token` is **single-use**. On every `HTTP 200`, the response's NEW `refresh_token`
@@ -96,6 +121,29 @@ OAuth internals." That is robust, not invulnerable.
 
 **Seeding:** the two currently-stored accounts hold dead refresh tokens (H2). Each needs
 ONE manual re-auth to seed a fresh token; proactive refresh keeps them alive thereafter.
+
+**Seeding mechanism (the gap that survived the first build — closed 2026-06-06):**
+"Re-auth seeds the backup store" was originally asserted without specifying HOW. There
+are exactly two re-auth paths, and only one of them seeded:
+
+| RE-AUTH PATH | WRITES LIVE KEYCHAIN | SEEDS BACKUP STORE |
+|---|---|---|
+| **In-app reauth flow** | ✅ (via CLI it spawns) | ✅ `captureCurrentCredentials` is called explicitly |
+| **External CLI `/login`** | ✅ | ❌ nothing tells the app to re-snapshot (pre-fix) |
+
+Observed live 2026-06-06: both accounts re-authed via CLI → live keychain fresh
+(`getAuthStatus loggedIn=true`) while both backups still returned `invalid_grant` on
+every proactive cycle. The refresh engine was correct; its input was never re-seeded.
+
+**Seeding invariant (normative):** whenever the live keychain token for the ACTIVE
+account differs from that account's backup-store snapshot, the app MUST re-capture
+(live → backup) on the next refresh cycle. Implemented in
+`AppState.updateActiveAccount` (self-heal block). Under D1 the comparison reads the
+keychain directly — there is no mirror to go stale. This makes the active account's
+seeding path-independent: CLI `/login`, in-app reauth, or any future path all converge.
+LIMIT: this heals the ACTIVE account only — the keychain holds one token at a time, so
+an INACTIVE account re-authed externally is overwritten by the next login and can only
+be seeded via the in-app reauth flow (which captures immediately, while it is active).
 
 ### Option B — Delegate to `claude auth status` (DEFERRED — future fallback)
 

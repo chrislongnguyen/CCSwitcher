@@ -77,12 +77,21 @@ final class AppState: ObservableObject {
         log.info("[refresh] Claude available: \(self.claudeAvailable)")
 
         if claudeAvailable {
-            do {
-                let status = try await claudeService.getAuthStatus()
-                updateActiveAccount(from: status)
-            } catch {
-                log.error("[refresh] getAuthStatus failed: \(error.localizedDescription)")
-                errorMessage = error.localizedDescription
+            // POPUP-FREE HOT PATH: do NOT spawn `claude auth status` here. The CLI
+            // subprocess reads the keychain via /usr/bin/security, which macOS
+            // trust-evaluates separately from this app → the recurring "security
+            // wants to access" popup, once per refresh cycle. Identity already
+            // lives in ~/.claude.json (canonical since CC v2.1.139) — read it
+            // directly. `claude auth status` remains ONLY in user-initiated flows
+            // (add/login/reauth), where one popup after an explicit action is fine.
+            if keychain.readOAuthIdentity() != nil {
+                let passiveStatus = AuthStatus(
+                    loggedIn: true, authMethod: nil, apiProvider: nil,
+                    email: nil, orgId: nil, orgName: nil, subscriptionType: nil
+                )
+                updateActiveAccount(from: passiveStatus)
+            } else {
+                log.info("[refresh] No oauthAccount in ~/.claude.json — treating as logged out (no CLI spawn)")
             }
         }
 
@@ -375,27 +384,45 @@ final class AppState: ObservableObject {
             errorMessage = svcErr.localizedDescription
             isLoading = false
             log.error("[switchTo] Switch failed: \(svcErr.localizedDescription)")
-            rollbackKeychain(to: currentActive)
+            // D3: rollback ONLY when the failure occurred after Step 3 wrote the
+            // keychain. Pre-write failures (staleScope/expired/noToken) left the
+            // keychain untouched — "restoring" it would clobber the live token
+            // with a possibly-stale backup (the 2026-06-06 logout bug).
+            if svcErr.occurredAfterKeychainWrite {
+                rollbackKeychain(to: currentActive)
+            } else {
+                log.info("[switchTo] No rollback — failure occurred before any keychain write (D3)")
+            }
         } catch {
             errorMessage = error.localizedDescription
             isLoading = false
             log.error("[switchTo] Switch failed: \(error.localizedDescription)")
-            rollbackKeychain(to: currentActive)
+            // D3: non-ClaudeServiceError throws all originate before Step 3's write
+            // (probe/network); the only post-write throws are the enum cases handled
+            // above. Never rollback here.
+            log.info("[switchTo] No rollback — failure not classified as post-keychain-write (D3)")
         }
     }
 
-    /// Best-effort keychain rollback after any partial-write failure (e.g.
+    /// Best-effort keychain rollback after a POST-WRITE switch failure (e.g.
     /// Step 4 verify fails, leaving the live keychain holding a broken token).
     /// Without this, the user can be left effectively logged out of Claude Code
     /// until they manually re-auth. DeepSeek v2 finding #2.
-    /// Safe under all error cases: if Step 1 didn't back up the source, the
-    /// get returns nil and we no-op. staleScope/expiredToken throw BEFORE any
-    /// write so restoring the source token is a no-op write of identical data.
+    /// D3: callers MUST gate on ClaudeServiceError.occurredAfterKeychainWrite —
+    /// invoking this after a pre-write failure writes a stale backup over a live
+    /// token (the 2026-06-06 CC-logout bug).
     private func rollbackKeychain(to sourceAccount: Account) {
         guard let backup = keychain.getAccountBackup(forAccountId: sourceAccount.id.uuidString) else { return }
-        _ = keychain.writeClaudeToken(backup.token)
-        _ = keychain.writeOAuthAccount(backup.oauthAccount)
-        log.warning("[switchTo] Restored keychain to source account (\(sourceAccount.email)) after switch failure")
+        let tokenOk = keychain.writeClaudeToken(backup.token)
+        let oauthOk = keychain.writeOAuthAccount(backup.oauthAccount)
+        if tokenOk && oauthOk {
+            log.warning("[switchTo] Restored keychain to source account (\(sourceAccount.email)) after switch failure")
+        } else {
+            // Surface loudly: a failed rollback leaves the live keychain on the broken
+            // target token — the user must /login (ltc-reviewer finding 2026-06-06).
+            log.error("[switchTo] ROLLBACK FAILED for \(sourceAccount.email) (token=\(tokenOk), oauth=\(oauthOk)) — live keychain may hold a broken token; manual /login required")
+            errorMessage = String(localized: "Switch failed AND rollback failed — run /login in a terminal to restore \(sourceAccount.email).", bundle: L10n.bundle)
+        }
     }
 
     /// Re-authenticate an account by running `claude auth login` and capturing fresh credentials.
@@ -470,14 +497,23 @@ final class AppState: ObservableObject {
 
     // MARK: - Usage
 
-    /// Proactively refresh stored tokens that are at or near expiry, persisting the
-    /// rotated refresh token each time (ROTATION-SAFETY). Runs every refresh cycle but
-    /// only issues a network grant when `expiresAt` is within SKEW — so at most ~once
-    /// per token lifetime (~8h), never a tight loop. ARCHITECTURE.md §Token Lifecycle.
+    /// Proactively refresh INACTIVE accounts' stored tokens that are at or near expiry,
+    /// persisting the rotated refresh token each time (ROTATION-SAFETY). Runs every
+    /// refresh cycle but only issues a network grant when `expiresAt` is within SKEW —
+    /// so at most ~once per token lifetime (~8h), never a tight loop.
+    /// D2 (ARCHITECTURE.md §Token Lifecycle): NEVER refresh-grant the ACTIVE account —
+    /// refresh tokens are single-use and the CC CLI rotates the active token on its own
+    /// clock; a second writer races it and one of them gets invalid_grant (observed live
+    /// 2026-06-06 as CC-session logouts). The active account is seeded read-only by the
+    /// self-heal in updateActiveAccount instead.
     private func refreshExpiringTokens() async {
         let skewMillis = 10.0 * 60 * 1000   // refresh when within 10 min of expiry
         let nowMillis = Date().timeIntervalSince1970 * 1000
         for account in accounts {
+            if account.isActive {
+                log.debug("[proactiveRefresh] skipping active \(account.email) (D2 — CLI owns its rotation)")
+                continue
+            }
             guard let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString),
                   let expiresAt = ClaudeService.extractExpiresAt(from: backup.token),
                   let refreshTok = ClaudeService.extractRefreshToken(from: backup.token) else {
@@ -499,11 +535,30 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// On a usage 401, mint a fresh access token via direct refresh-grant, persist the
-    /// rotated token (ROTATION-SAFETY), and retry usage ONCE. Returns true on recovery.
-    /// Safe for inactive accounts: persist writes the backup store (keychain only when
-    /// active), so there is no silent live-keychain swap that could race the CLI.
+    /// On a usage 401, recover and retry usage ONCE. Returns true on recovery.
+    /// ACTIVE account (D2): NEVER refresh-grant — the CC CLI owns the active token's
+    /// rotation and has likely already refreshed it; re-read the keychain and retry
+    /// with whatever the CLI minted. Refresh-granting here would consume the CLI's
+    /// single-use refresh token and log the user's CC session out.
+    /// INACTIVE accounts: direct refresh-grant against the backup store (no keychain
+    /// write — no race with the CLI), persist rotated creds (ROTATION-SAFETY), retry.
     private func refreshAndRetryUsage(account: Account) async -> Bool {
+        if account.isActive {
+            guard let tokenJSON = keychain.readClaudeToken(),
+                  let accessToken = ClaudeService.extractAccessToken(from: tokenJSON) else {
+                return false
+            }
+            do {
+                let usage = try await claudeService.getUsageLimits(accessToken: accessToken)
+                accountUsage[account.id] = usage
+                accountUsageErrors[account.id] = nil
+                log.info("[fetchUsage] Recovered \(account.email) via keychain re-read (D2).")
+                return true
+            } catch {
+                log.error("[fetchUsage] Keychain re-read retry failed for \(account.email): \(error.localizedDescription)")
+                return false
+            }
+        }
         guard let backup = keychain.getAccountBackup(forAccountId: account.id.uuidString),
               let refreshTok = ClaudeService.extractRefreshToken(from: backup.token) else {
             return false
@@ -674,6 +729,20 @@ final class AppState: ObservableObject {
             activeAccount = accounts[index]
             saveAccounts()
             log.info("[updateActiveAccount] Matched existing account at index \(index)")
+
+            // SELF-HEAL (ARCHITECTURE.md §Seeding invariant): an external re-auth
+            // (CLI `/login`) rotates the live keychain token WITHOUT going through the
+            // in-app reauth flow, leaving the backup-store snapshot holding a dead
+            // refresh token that proactiveRefresh then flogs forever. Whenever the
+            // live token differs from this account's backup, re-snapshot it.
+            // Idempotent: string-equal tokens skip; capture re-reads live keychain.
+            // Under D1, readClaudeToken() reads the keychain directly — no mirror to go stale.
+            let accountId = accounts[index].id.uuidString
+            if let liveToken = keychain.readClaudeToken(),
+               keychain.getAccountBackup(forAccountId: accountId)?.token != liveToken {
+                let captured = claudeService.captureCurrentCredentials(forAccountId: accountId)
+                log.info("[updateActiveAccount] Live token differs from backup — re-captured: \(captured)")
+            }
         } else if accounts.isEmpty {
             let account = Account(
                 email: email,

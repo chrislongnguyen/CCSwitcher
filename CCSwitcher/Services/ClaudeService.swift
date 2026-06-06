@@ -382,16 +382,10 @@ final class ClaudeService: Sendable {
             log.error("[switchAccount] Step 4: Identity mismatch — got \(identity.emailAddress), expected \(targetAccount.email)")
             throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: identity.emailAddress)
         }
-        // Secondary: best-effort auth status check — warn on failure, never throw.
-        // This lets us detect edge cases (e.g. keychain desync) without blocking switches.
-        do {
-            let status = try await getAuthStatus()
-            if !status.loggedIn {
-                log.warning("[switchAccount] Step 4: Secondary check — claude reports not logged in despite correct identity")
-            }
-        } catch {
-            log.warning("[switchAccount] Step 4: Secondary auth-status check failed (non-fatal): \(error.localizedDescription)")
-        }
+        // No secondary `claude auth status` check here: the subprocess reads the
+        // keychain via /usr/bin/security → user-facing popup on every switch, and
+        // it was already non-fatal dead weight (failed exit-1 on 2026-06-06 while
+        // the switch verified fine via the primary ~/.claude.json read above).
         log.info("[switchAccount] Step 4: Switch verified — logged in as \(identity.emailAddress)")
     }
 
@@ -505,6 +499,21 @@ enum ClaudeServiceError: LocalizedError {
     case switchWrongAccount(expected: String, actual: String)
     case staleScope(email: String)
     case expiredToken(email: String)
+
+    /// D3 (ARCHITECTURE.md §Token Lifecycle): true ONLY for failures thrown after
+    /// switchAccount Step 3 began writing the live keychain. Rollback is destructive
+    /// for pre-write failures — restoring the backup over an untouched keychain
+    /// clobbered a fresh CLI login with a stale token (observed 2026-06-06 12:02:56).
+    var occurredAfterKeychainWrite: Bool {
+        switch self {
+        case .keychainWriteFailed, .oauthAccountWriteFailed,
+             .switchVerificationFailed, .switchWrongAccount:
+            return true
+        case .invalidOutput, .cliError, .processLaunchFailed,
+             .noTokenForAccount, .staleScope, .expiredToken:
+            return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {

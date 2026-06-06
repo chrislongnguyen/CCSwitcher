@@ -47,7 +47,8 @@ struct AnyCodable: Codable, Equatable {
 }
 
 /// Manages token + identity storage:
-/// - Claude CLI's token: file-primary (live-token.txt), keychain fallback via Security framework.
+/// - Claude CLI's token: keychain ONLY (D1), read/write via `security` CLI subprocess
+///   (partition-list correctness — see Token Operations section below).
 /// - Claude CLI's identity: read/write oauthAccount in ~/.claude.json.
 /// - Our backups: per-account {token, oauthAccount} in ~/.ccswitcher/backups.json (file, no keychain ACL).
 final class KeychainService: Sendable {
@@ -55,7 +56,6 @@ final class KeychainService: Sendable {
 
     private let claudeService = "Claude Code-credentials"
     private let claudeAccount: String
-    private let liveTokenPath: String
     private let backupsFilePath: String
     private let claudeJsonPath: String
 
@@ -64,7 +64,6 @@ final class KeychainService: Sendable {
 
         let home = NSHomeDirectory()
         let dir = home + "/.ccswitcher"
-        self.liveTokenPath = dir + "/live-token.txt"
         self.backupsFilePath = dir + "/backups.json"
         self.claudeJsonPath = home + "/.claude.json"
 
@@ -80,110 +79,114 @@ final class KeychainService: Sendable {
             try? FileManager.default.removeItem(atPath: oldPath)
         }
 
+        // D1 (ARCHITECTURE.md §Token Lifecycle): the keychain is the ONLY copy of the
+        // live token. The legacy file mirror went stale after every CLI /login and
+        // ~8h CLI self-refresh, poisoning every load-bearing read. Delete it forever.
+        let legacyMirrorPath = dir + "/live-token.txt"
+        if FileManager.default.fileExists(atPath: legacyMirrorPath) {
+            try? FileManager.default.removeItem(atPath: legacyMirrorPath)
+            log.info("init: Deleted legacy live-token.txt mirror (D1 single-source-of-truth)")
+        }
+
         log.info("init: claudeAccount=\(claudeAccount), backupsFile=\(backupsFilePath)")
     }
 
-    // MARK: - Claude Code Token Operations (file primary, keychain fallback)
+    // MARK: - Claude Code Token Operations (keychain ONLY — D1 single source of truth)
+    //
+    // PARTITION-LIST RULE (the popup class, closed 2026-06-06): items written via the
+    // `security` CLI carry the `apple-tool:` partition — the claude CLI (which reads
+    // through /usr/bin/security) then reads them SILENTLY. Items written natively
+    // (SecItemUpdate/Add) carry THIS app's partition — every CLI read then hits a
+    // login-keychain password prompt that "Always Allow" cannot persist. So Claude's
+    // item is read AND written via the `security` subprocess (upstream
+    // XueshiQiao/CCSwitcher's mechanism, ported verbatim 2026-06-06).
+    //
+    // Token-in-argv tradeoff (accepted, documented): the token is visible in the
+    // subprocess argv for its ~ms lifetime. The stdin `-i` alternative was probed
+    // 2026-06-06 and CORRUPTS secrets containing backslashes (lexer strips them) —
+    // a corrupted credential write logs the user out, strictly worse than the
+    // argv exposure on a single-user machine.
 
     func readClaudeToken() -> String? {
-        // Primary: file-based token (no keychain prompt, survives rebuilds)
-        if let fileToken = readTokenFromFile() {
-            return fileToken
-        }
-        // Fallback: Security framework keychain (may trigger macOS prompt)
-        if let keychainToken = readTokenFromKeychain() {
-            return keychainToken
-        }
-        return nil
-    }
+        let token = runSecurity(args: [
+            "find-generic-password",
+            "-s", claudeService,
+            "-a", claudeAccount,
+            "-w"
+        ])
 
-    private func readTokenFromFile() -> String? {
-        guard FileManager.default.fileExists(atPath: liveTokenPath),
-              let token = try? String(contentsOfFile: liveTokenPath, encoding: .utf8) else {
+        if let token {
+            let sanitized = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            log.info("[readClaudeToken] Found via security CLI, length=\(sanitized.count)")
+            return sanitized
+        } else {
+            log.error("[readClaudeToken] No token found via security CLI")
             return nil
-        }
-        let sanitized = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sanitized.isEmpty else { return nil }
-        log.info("[readClaudeToken] Found via file, length=\(sanitized.count)")
-        return sanitized
-    }
-
-    private func readTokenFromKeychain() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: claudeService,
-            kSecAttrAccount as String: claudeAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-
-        guard status == errSecSuccess, let data = item as? Data,
-              let token = String(data: data, encoding: .utf8) else {
-            log.warning("[readClaudeToken] Keychain fallback failed, status=\(status)")
-            return nil
-        }
-
-        let sanitized = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        log.info("[readClaudeToken] Found via keychain, length=\(sanitized.count)")
-        _ = saveTokenToFile(sanitized) // seed file so next read skips keychain entirely
-        return sanitized
-    }
-
-    /// Refresh the local token file (call after `claude auth login` or manual keychain update).
-    func refreshTokenFile() -> Bool {
-        if let token = readTokenFromKeychain() {
-            return saveTokenToFile(token)
-        }
-        return false
-    }
-
-    private func saveTokenToFile(_ token: String) -> Bool {
-        do {
-            try token.write(toFile: liveTokenPath, atomically: true, encoding: .utf8)
-            // Restrict to owner only (same as ~/.claude.json)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: liveTokenPath)
-            log.info("[saveTokenToFile] Token saved to \(liveTokenPath)")
-            return true
-        } catch {
-            log.error("[saveTokenToFile] Failed: \(error.localizedDescription)")
-            return false
         }
     }
 
     func writeClaudeToken(_ token: String) -> Bool {
-        // Keep the file in sync
-        _ = saveTokenToFile(token)
+        // Delete then add (security CLI has no pure "update" for generic passwords).
+        // -U on add is belt-and-braces if the delete raced a concurrent re-create.
+        _ = runSecurityStatus(args: ["delete-generic-password", "-s", claudeService, "-a", claudeAccount])
 
-        // Also write to keychain
-        guard let data = token.data(using: .utf8) else {
-            log.error("[writeClaudeToken] Failed to encode token as UTF-8")
+        let added = runSecurityStatus(args: [
+            "add-generic-password",
+            "-s", claudeService,
+            "-a", claudeAccount,
+            "-w", token,
+            "-U"
+        ])
+        log.info("[writeClaudeToken] Result: \(added)")
+        return added
+    }
+
+    // MARK: - `security` CLI subprocess (Claude's item ONLY — see partition-list rule above)
+
+    private func runSecurity(args: [String]) -> String? {
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = args
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                log.debug("[runSecurity] Exit \(process.terminationStatus) for: security \(args.prefix(2).joined(separator: " "))...")
+                return nil
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return output?.isEmpty == true ? nil : output
+        } catch {
+            log.error("[runSecurity] Launch failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func runSecurityStatus(args: [String]) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let ok = process.terminationStatus == 0
+            if !ok {
+                log.debug("[runSecurityStatus] Exit \(process.terminationStatus) for: security \(args.prefix(2).joined(separator: " "))...")
+            }
+            return ok
+        } catch {
+            log.error("[runSecurityStatus] Launch failed: \(error.localizedDescription)")
             return false
         }
-
-        let searchQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: claudeService,
-            kSecAttrAccount as String: claudeAccount
-        ]
-
-        let updateAttrs: [String: Any] = [
-            kSecValueData as String: data
-        ]
-
-        var status = SecItemUpdate(searchQuery as CFDictionary, updateAttrs as CFDictionary)
-
-        if status == errSecItemNotFound {
-            var addQuery = searchQuery
-            addQuery[kSecValueData as String] = data
-            status = SecItemAdd(addQuery as CFDictionary, nil)
-        }
-
-        let ok = status == errSecSuccess
-        log.info("[writeClaudeToken] Result: \(ok) (status=\(status))")
-        return ok
     }
 
     // MARK: - ~/.claude.json oauthAccount Operations
