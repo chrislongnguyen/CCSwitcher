@@ -1,11 +1,80 @@
 import SwiftUI
 
+private let popoverLog = FileLog("Popover")
+
+// MARK: - Popover Height Measurement
+//
+// The popover frame adapts to the natural height of the Usage tab's content
+// plus the surrounding chrome (header, tab bar, footer). Both are MEASURED
+// via SwiftUI PreferenceKeys so the layout stays correct when fonts,
+// paddings, localization, or content change — no hardcoded layout numbers.
+//
+// Contract for future contributors:
+//   * Every chrome element in MainMenuView.body must call `.measureChromeHeight()`.
+//     Currently: headerView, promoBanner (when shown), tabBar, footerView.
+//   * UsageDashboardView's scrollable content must call `.measureUsageContentHeight()`
+//     on its inner VStack (the one inside the ScrollView, not the ScrollView itself).
+//   * The Divider between content and footer is intentionally not measured
+//     (1pt constant, accounted for in the formula).
+
+/// Reports the intrinsic height of the Usage tab's inner content.
+/// Uses `max` reduce so only the currently visible measurement wins.
+struct UsageContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// Reports the summed height of all chrome elements in MainMenuView.
+/// Uses `+=` reduce to aggregate header + tabBar + footer (etc.) into one value.
+struct ChromeHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value += nextValue()
+    }
+}
+
+extension View {
+    /// Report this view's height as Usage tab content.
+    /// Apply to the inner VStack of the Usage tab (inside its ScrollView).
+    func measureUsageContentHeight() -> some View {
+        background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: UsageContentHeightKey.self,
+                    value: geo.size.height
+                )
+            }
+        )
+    }
+
+    /// Report this view's height as chrome (header/tabBar/footer/etc.).
+    /// Apply to every non-content element in MainMenuView.body.
+    func measureChromeHeight() -> some View {
+        background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: ChromeHeightKey.self,
+                    value: geo.size.height
+                )
+            }
+        )
+    }
+}
+
 /// The main popover content shown when clicking the menubar icon.
 struct MainMenuView: View {
     @EnvironmentObject private var appState: AppState
     @AppStorage("refreshInterval") private var refreshInterval: Double = 300
     @AppStorage("showFullEmail") private var showFullEmail = false
     @State private var selectedTab: Tab = .usage
+
+    // Measured heights driving the popover frame.
+    // Defaults are reasonable fallbacks for the first render pass, before
+    // the GeometryReader-based measurements fire.
+    @State private var usageContentHeight: CGFloat = 420
+    @State private var chromeHeight: CGFloat = 180
 
     enum Tab: String, CaseIterable {
         case usage, costs, accounts
@@ -31,13 +100,16 @@ struct MainMenuView: View {
         VStack(spacing: 0) {
             // Header
             headerView
+                .measureChromeHeight()
 
             if isPromoActive() {
                 promoBannerView
+                    .measureChromeHeight()
             }
 
             // Tab selector
             tabBar
+                .measureChromeHeight()
 
             // Content
             Group {
@@ -56,9 +128,62 @@ struct MainMenuView: View {
 
             // Footer
             footerView
+                .measureChromeHeight()
         }
-        .frame(width: 360, height: 540)
+        .frame(width: 360, height: popoverHeight)
+        .animation(.easeInOut(duration: 0.2), value: popoverHeight)
+        .background(
+            // Probe: report the actual rendered size of the outer VStack
+            // (after .frame is applied). If this doesn't match popoverHeight,
+            // we have a frame-not-applied problem; if it matches but the
+            // popover panel is still bigger, the issue is the panel itself.
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear {
+                        popoverLog.info("[actual] vstack size=\(geo.size.width)x\(geo.size.height)")
+                    }
+                    .onChange(of: geo.size) { _, new in
+                        popoverLog.info("[actual] vstack size=\(new.width)x\(new.height)")
+                    }
+            }
+        )
         .background(.ultraThinMaterial)
+        .onAppear {
+            popoverLog.info("[appear] tab=\(self.selectedTab.rawValue) chrome=\(self.chromeHeight) usage=\(self.usageContentHeight) popover=\(self.popoverHeight)")
+        }
+        .onPreferenceChange(UsageContentHeightKey.self) { value in
+            if value > 0 { usageContentHeight = value }
+        }
+        .onPreferenceChange(ChromeHeightKey.self) { value in
+            if value > 0 { chromeHeight = value }
+        }
+        // Explicitly observe popoverHeight so SwiftUI tracks the computed
+        // value as a dependency of the .frame modifier above. Without this,
+        // some Release builds appear to skip the frame update when only the
+        // underlying @State (chromeHeight / usageContentHeight) changes —
+        // the panel locks at the initial-render height and shows the
+        // visible empty bands users reported in 1.5.3.
+        .onChange(of: popoverHeight) { _, new in
+            popoverLog.info("[height] popover=\(new)")
+        }
+    }
+
+    // MARK: - Dynamic Popover Height
+
+    /// Popover height is driven by measured Usage tab content + measured chrome.
+    /// The Usage tab is chosen as the height reference because it's the
+    /// content-heaviest tab; sizing for it gives other tabs enough headroom.
+    /// Capped only by available screen space; no artificial floor — the popover
+    /// matches its content exactly, so there is no padding gap inside the
+    /// ScrollView when content is short.
+    private var popoverHeight: CGFloat {
+        let screenCap: CGFloat = (NSScreen.main?.visibleFrame.height ?? 900) - 100
+        let maxHeight: CGFloat = min(900, screenCap)
+
+        // +1 for the Divider between content and footer (not measured).
+        let desired = chromeHeight + usageContentHeight + 1
+
+        return min(maxHeight, desired)
     }
 
     // MARK: - Promo Banner
@@ -85,25 +210,10 @@ struct MainMenuView: View {
     }
     
     private func isPromoActive() -> Bool {
-        let date = Date()
-        let calendar = Calendar(identifier: .gregorian)
-        
-        var promoStartComponents = DateComponents()
-        promoStartComponents.year = 2026
-        promoStartComponents.month = 3
-        promoStartComponents.day = 13
-        
-        var promoEndComponents = DateComponents()
-        promoEndComponents.year = 2026
-        promoEndComponents.month = 3
-        promoEndComponents.day = 29 // up to March 28 inclusive
-        
-        guard let start = calendar.date(from: promoStartComponents),
-              let end = calendar.date(from: promoEndComponents) else {
-            return false
-        }
-        
-        return date >= start && date < end
+        // Banner visibility tracks the campaign window; the menu-bar icon uses
+        // `DoubleUsagePromo.isActive` for the currently-doubled state. Both now
+        // share one source of truth (no duplicated date logic).
+        DoubleUsagePromo.isCampaignActive()
     }
     
     private var localOffPeakTimeString: String {

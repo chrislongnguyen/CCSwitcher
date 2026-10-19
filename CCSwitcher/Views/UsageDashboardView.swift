@@ -23,6 +23,7 @@ private struct StatWithTooltip<Content: View>: View {
 /// Shows real usage limits from Claude API, one card per account.
 struct UsageDashboardView: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var menuBarConfig: MenuBarConfig
     @AppStorage("showFullEmail") private var showFullEmail = false
 
     var body: some View {
@@ -75,6 +76,10 @@ struct UsageDashboardView: View {
                 }
             }
             .padding(.vertical, 12)
+            // Report this VStack's intrinsic height to MainMenuView so it can
+            // size the popover frame to fit the Usage tab's content exactly.
+            // See MainMenuView.swift for the measurement contract.
+            .measureUsageContentHeight()
         }
     }
 
@@ -131,6 +136,8 @@ struct UsageDashboardView: View {
 
             // Model usage row — same style as stats above
             HStack(spacing: 0) {
+                modelStat(name: "Fable", count: stats.modelUsage["Fable"] ?? 0,
+                          tooltip: "Claude Fable 5 — most powerful model, the new flagship tier")
                 modelStat(name: "Opus", count: stats.modelUsage["Opus"] ?? 0,
                           tooltip: "Claude Opus 4 — most capable model, best for complex tasks")
                 modelStat(name: "Sonnet", count: stats.modelUsage["Sonnet"] ?? 0,
@@ -182,6 +189,7 @@ struct UsageDashboardView: View {
 
     private func modelColor(_ name: String) -> Color {
         switch name {
+        case "Fable": return .purple
         case "Opus": return .brand
         case "Sonnet": return .blue
         case "Haiku": return .green
@@ -197,6 +205,7 @@ struct UsageDashboardView: View {
             if let usage = usage {
                 usageBars(usage)
                 extraUsageRow(usage.extraUsage)
+                sampleAgeLabel(account)
             } else if let errorState = appState.accountUsageErrors[account.id] {
                 HStack {
                     Image(systemName: errorState.isRateLimited ? "timer" : (errorState.isExpired ? "exclamationmark.triangle" : "xmark.circle"))
@@ -209,10 +218,13 @@ struct UsageDashboardView: View {
                 }
                 .padding(.top, 4)
             } else {
+                // No sample yet (accounts are polled round-robin) - this is a
+                // waiting state, not an error. The old hardcoded "Token expired"
+                // text here made healthy accounts look broken.
                 HStack {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(.yellow)
-                    Text("Token expired. Switch to this account in Claude Code to refresh.")
+                    Image(systemName: "hourglass")
+                        .foregroundStyle(.secondary)
+                    Text("Waiting for usage data...")
                         .font(.caption)
                         .foregroundStyle(.textSecondary)
                     Spacer()
@@ -222,6 +234,24 @@ struct UsageDashboardView: View {
         }
         .cardStyle(fill: account.isActive ? .cardFill : .cardFill)
         .sectionPadding()
+    }
+
+    /// Accounts are polled round-robin (active + one other per cycle), so a
+    /// card's numbers can be several cycles old — say so instead of letting a
+    /// stale percentage render exactly like a live one. Hidden while the sample
+    /// is fresh (< 90s); the relative text then counts up by itself.
+    @ViewBuilder
+    private func sampleAgeLabel(_ account: Account) -> some View {
+        if let sampledAt = appState.accountUsageSampledAt[account.id],
+           Date().timeIntervalSince(sampledAt) >= 90 {
+            HStack(spacing: 3) {
+                Image(systemName: "clock")
+                    .font(.caption2)
+                Text("Updated \(Text(sampledAt, style: .relative)) ago")
+                    .font(.caption2)
+            }
+            .foregroundStyle(.textSecondary)
+        }
     }
 
     @ViewBuilder
@@ -236,7 +266,7 @@ struct UsageDashboardView: View {
                 .lineLimit(1)
 
             if account.isActive {
-                Badge(text: String(localized: "Active"), color: .green)
+                Badge(text: String(localized: "Active", bundle: L10n.bundle), color: .green)
             }
 
             Spacer()
@@ -250,10 +280,20 @@ struct UsageDashboardView: View {
     @ViewBuilder
     private func usageBars(_ usage: UsageAPIResponse) -> some View {
         if let session = usage.fiveHour {
-            usageRow(label: "Session", resetText: session.resetTimeString, utilization: session.utilization ?? 0)
+            usageRow(
+                label: "Session",
+                resetText: session.resetTimeString,
+                utilization: session.utilization ?? 0,
+                kind: .session
+            )
         }
         if let weekly = usage.sevenDay {
-            usageRow(label: "Weekly", resetText: weekly.resetTimeString, utilization: weekly.utilization ?? 0)
+            usageRow(
+                label: "Weekly",
+                resetText: weekly.resetTimeString,
+                utilization: weekly.utilization ?? 0,
+                kind: .weekly
+            )
         }
     }
 
@@ -280,8 +320,10 @@ struct UsageDashboardView: View {
 
     // MARK: - Usage Row
 
-    private func usageRow(label: LocalizedStringKey, resetText: String?, utilization: Double) -> some View {
-        VStack(spacing: 5) {
+    private func usageRow(label: LocalizedStringKey, resetText: String?, utilization: Double, kind: LimitBarKind) -> some View {
+        let fillColor = menuBarConfig.limitBarColor(for: kind, utilization: utilization, context: .dashboard)
+
+        return VStack(spacing: 5) {
             HStack {
                 Text(label)
                     .font(.caption)
@@ -302,7 +344,7 @@ struct UsageDashboardView: View {
                             .frame(height: 7)
 
                         RoundedRectangle(cornerRadius: 3)
-                            .fill(colorForUtilization(utilization))
+                            .fill(fillColor)
                             .frame(width: max(0, geo.size.width * min(utilization / 100.0, 1.0)), height: 7)
                     }
                 }
@@ -310,15 +352,9 @@ struct UsageDashboardView: View {
 
                 Text("\(Int(utilization))%")
                     .font(.caption.weight(.medium).monospacedDigit())
-                    .foregroundStyle(colorForUtilization(utilization))
+                    .foregroundStyle(fillColor)
                     .frame(width: 34, alignment: .trailing)
             }
         }
-    }
-
-    private func colorForUtilization(_ pct: Double) -> Color {
-        if pct >= 90 { return .red }
-        if pct >= 60 { return .orange }
-        return .green
     }
 }

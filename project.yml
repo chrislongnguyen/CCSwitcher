@@ -13,6 +13,11 @@ options:
     - de
     - fr
 
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.9.0
+
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -40,13 +45,19 @@ targets:
           - CFBundleURLName: me.xueshi.ccswitcher
             CFBundleURLSchemes:
               - ccswitcher
+        # Sparkle: feed URL points at the always-latest release's appcast asset.
+        # CI uploads `appcast.xml` to each release alongside the DMG.
+        SUFeedURL: https://github.com/XueshiQiao/CCSwitcher/releases/latest/download/appcast.xml
+        # Public EdDSA key. The matching private key is the `SPARKLE_EDDSA_KEY`
+        # GitHub secret used by CI to sign each DMG.
+        SUPublicEDKey: N9jOZ2Xyo63FdNvkDCRiMwXFnFglOqTdmx6nw7ZwTS4=  # gitleaks:allow (public verification key, not a secret)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: me.xueshi.ccswitcher
         CODE_SIGN_ENTITLEMENTS: CCSwitcher/Resources/CCSwitcher.entitlements
         PRODUCT_NAME: CCSwitcher
-        MARKETING_VERSION: "1.5.0+token-refresh.1"
-        CURRENT_PROJECT_VERSION: "48"
+        MARKETING_VERSION: "1.12.0"
+        CURRENT_PROJECT_VERSION: "66"
         COMBINE_HIDPI_IMAGES: true
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
@@ -54,11 +65,12 @@ targets:
       path: CCSwitcher/Resources/CCSwitcher.entitlements
       properties:
         com.apple.security.application-groups:
-          - group.me.xueshi.ccswitcher
+          - 584KQTRF3B.me.xueshi.ccswitcher
     dependencies:
       - target: CCSwitcherWidgetExtension
         embed: true
         codeSign: true
+      - package: Sparkle
 
   CCSwitcherWidgetExtension:
     type: extensionkit-extension
@@ -79,8 +91,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: me.xueshi.ccswitcher.widget
         CODE_SIGN_ENTITLEMENTS: CCSwitcherWidget/Resources/CCSwitcherWidget.entitlements
         PRODUCT_NAME: CCSwitcherWidgetExtension
-        MARKETING_VERSION: "1.5.0+token-refresh.1"
-        CURRENT_PROJECT_VERSION: "48"
+        MARKETING_VERSION: "1.12.0"
+        CURRENT_PROJECT_VERSION: "66"
         SWIFT_VERSION: "6.0"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         CODE_SIGN_STYLE: Automatic
@@ -93,4 +105,4 @@ targets:
       properties:
         com.apple.security.app-sandbox: true
         com.apple.security.application-groups:
-          - group.me.xueshi.ccswitcher
+          - 584KQTRF3B.me.xueshi.ccswitcher

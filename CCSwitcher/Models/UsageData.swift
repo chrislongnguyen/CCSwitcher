@@ -60,6 +60,40 @@ struct UsageWindow: Codable {
             return "\(minutes) min"
         }
     }
+
+    /// Compact countdown rendering for narrow menu-bar modules.
+    /// Always returns a fixed-shape string ("now", "5m", "2h 14m", "4d 6h").
+    /// Never falls back to a date format — the menu bar can't afford the width.
+    var compactResetString: String? {
+        guard let date = resetsAtDate else { return nil }
+        let remaining = Int(date.timeIntervalSinceNow)
+        guard remaining > 0 else { return "now" }
+
+        let days = remaining / 86_400
+        let hours = (remaining % 86_400) / 3600
+        let minutes = (remaining % 3600) / 60
+
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(max(minutes, 1))m"
+    }
+
+    /// How much of the rate-limit window has already elapsed, as a 0–100
+    /// percentage: `1 − remaining / windowSeconds`, clamped to [0, 100].
+    /// `windowSeconds` is the fixed window length (5h = 18000, 7d = 604800).
+    /// Returns nil if there's no reset timestamp. Compared against the usage
+    /// bar this shows whether you're burning faster or slower than the clock.
+    func elapsedPercent(windowSeconds: Double) -> Double? {
+        guard windowSeconds > 0, let date = resetsAtDate else { return nil }
+        let elapsed = 1.0 - (date.timeIntervalSinceNow / windowSeconds)
+        return min(max(elapsed, 0), 1) * 100
+    }
+}
+
+/// Fixed rate-limit window lengths, in seconds.
+enum RateLimitWindow {
+    static let fiveHourSeconds: Double = 5 * 60 * 60       // 18,000
+    static let sevenDaySeconds: Double = 7 * 24 * 60 * 60  // 604,800
 }
 
 struct ExtraUsage: Codable {

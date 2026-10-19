@@ -59,6 +59,13 @@ final class KeychainService: Sendable {
     private let backupsFilePath: String
     private let claudeJsonPath: String
 
+    /// Serializes every access to the backup store. All backups live in ONE
+    /// file (`~/.ccswitcher/backups.json`), so each mutation is load-whole-store -> mutate -> save-
+    /// whole-store; two of those interleaving (AppState runs on the main actor,
+    /// but `ClaudeService.switchAccount` runs off it) can silently drop another
+    /// account's freshly written credentials.
+    private let storeLock = NSLock()
+
     private init() {
         self.claudeAccount = NSUserName()
 
@@ -259,29 +266,81 @@ final class KeychainService: Sendable {
     func saveAccountBackup(token: String, oauthAccount: [String: AnyCodable], forAccountId accountId: String) -> Bool {
         let email = (oauthAccount["emailAddress"]?.value as? String) ?? "?"
         log.info("[saveBackup] Saving for \(accountId) (\(email)), token length=\(token.count)")
-        var store = loadBackupStore()
+        storeLock.lock()
+        defer { storeLock.unlock() }
+        var store: [String: AccountBackup]
+        switch loadBackupStore() {
+        case .loaded(let dict): store = dict
+        case .empty: store = [:]
+        case .failed(let reason):
+            // Writing a mutated copy back after a failed load would replace
+            // EVERY account's credentials with just this one entry. Refuse.
+            log.error("[saveBackup] REFUSED: store unreadable (\(reason)); writing now would destroy the other accounts' backups")
+            return false
+        }
         store[accountId] = AccountBackup(token: token, oauthAccount: oauthAccount)
         let result = saveBackupStore(store)
         log.info("[saveBackup] Result: \(result)")
         return result
     }
 
-    func getAccountBackup(forAccountId accountId: String) -> AccountBackup? {
-        let store = loadBackupStore()
-        let backup = store[accountId]
-        if let backup {
-            let email = (backup.oauthAccount["emailAddress"]?.value as? String) ?? "?"
-            log.info("[getBackup] Found for \(accountId) (\(email)), token length=\(backup.token.count)")
-        } else {
-            log.error("[getBackup] No backup for accountId=\(accountId)")
+    /// Result of looking up one account's backup. "The entry does not exist"
+    /// and "the store could not be read right now" are different answers with
+    /// different remedies (re-authenticate vs simply try again later), so the
+    /// distinction is kept at the public boundary instead of collapsing both
+    /// into nil.
+    enum BackupLookup {
+        case found(AccountBackup)
+        case missing
+        case storeUnavailable
+    }
+
+    func lookupAccountBackup(forAccountId accountId: String) -> BackupLookup {
+        storeLock.lock()
+        defer { storeLock.unlock() }
+        switch loadBackupStore() {
+        case .loaded(let store):
+            guard let backup = store[accountId] else {
+                log.error("[getBackup] No backup for accountId=\(accountId)")
+                return .missing
+            }
+            // Account id only — no email in logs (HARD RULE 6); the id is a
+            // locally-minted UUID that correlates log lines without
+            // identifying anyone.
+            log.info("[getBackup] Found for \(accountId), credential length=\(backup.token.count)")
+            return .found(backup)
+        case .empty:
+            log.error("[getBackup] No backup for accountId=\(accountId) (store is empty)")
+            return .missing
+        case .failed(let reason):
+            log.error("[getBackup] Store unreadable (\(reason)); \(accountId) unavailable until it recovers")
+            return .storeUnavailable
         }
-        return backup
+    }
+
+    /// Convenience for call sites where "missing" and "unavailable" demand the
+    /// same behavior (skip / treat as not switchable). Paths that tell the user
+    /// what to DO about it must use `lookupAccountBackup` instead.
+    func getAccountBackup(forAccountId accountId: String) -> AccountBackup? {
+        if case .found(let backup) = lookupAccountBackup(forAccountId: accountId) {
+            return backup
+        }
+        return nil
     }
 
     @discardableResult
     func removeAccountBackup(forAccountId accountId: String) -> Bool {
         log.info("[removeBackup] Removing for accountId=\(accountId)")
-        var store = loadBackupStore()
+        storeLock.lock()
+        defer { storeLock.unlock() }
+        var store: [String: AccountBackup]
+        switch loadBackupStore() {
+        case .loaded(let dict): store = dict
+        case .empty: return true
+        case .failed(let reason):
+            log.error("[removeBackup] REFUSED: store unreadable (\(reason)); writing now would destroy the other accounts' backups")
+            return false
+        }
         store.removeValue(forKey: accountId)
         return saveBackupStore(store)
     }
@@ -293,17 +352,38 @@ final class KeychainService: Sendable {
 
     // MARK: - Backup Store (file-based — survives rebuilds and CC auto-updates)
 
-    private func loadBackupStore() -> [String: AccountBackup] {
-        guard FileManager.default.fileExists(atPath: backupsFilePath),
-              let data = FileManager.default.contents(atPath: backupsFilePath),
-              let dict = try? JSONDecoder().decode([String: AccountBackup].self, from: data) else {
-            log.debug("[loadBackupStore] No existing backups at \(backupsFilePath)")
-            return [:]
-        }
-        log.debug("[loadBackupStore] Loaded \(dict.count) entries from file")
-        return dict
+    /// Result of reading the backup file. The `empty`/`failed` distinction is
+    /// load-bearing: `empty` means the file genuinely does not exist yet, while
+    /// `failed` means it exists but could not be read or decoded. Mutating "what we
+    /// loaded" after a failed load and saving it back would truncate the store to
+    /// the single entry being saved, destroying every other account's credentials.
+    private enum BackupStoreLoad {
+        case loaded([String: AccountBackup])
+        case empty
+        case failed(String)
     }
 
+    /// Must be called with `storeLock` held.
+    private func loadBackupStore() -> BackupStoreLoad {
+        guard FileManager.default.fileExists(atPath: backupsFilePath) else {
+            log.debug("[loadBackupStore] No existing backups at \(backupsFilePath)")
+            return .empty
+        }
+        guard let data = FileManager.default.contents(atPath: backupsFilePath) else {
+            log.error("[loadBackupStore] backups.json exists but could not be read")
+            return .failed("backups.json unreadable")
+        }
+        guard let dict = try? JSONDecoder().decode([String: AccountBackup].self, from: data) else {
+            // Data exists but we can't parse it. It is NOT gone — refuse to treat it
+            // as empty so nothing ever writes over it.
+            log.error("[loadBackupStore] backups.json exists (\(data.count) bytes) but did not decode")
+            return .failed("undecodable store data")
+        }
+        log.debug("[loadBackupStore] Loaded \(dict.count) entries from file")
+        return .loaded(dict)
+    }
+
+    /// Must be called with `storeLock` held.
     private func saveBackupStore(_ store: [String: AccountBackup]) -> Bool {
         do {
             let data = try JSONEncoder().encode(store)
@@ -347,7 +427,16 @@ final class KeychainService: Sendable {
     /// + token file. Returns false on ANY write failure — the caller MUST treat false as
     /// fatal and NOT proceed as though the refresh succeeded.
     func persistRefreshedCreds(_ creds: RefreshedCreds, forAccountId accountId: String, isActive: Bool) -> Bool {
-        var store = loadBackupStore()
+        storeLock.lock()
+        defer { storeLock.unlock() }
+        var store: [String: AccountBackup]
+        switch loadBackupStore() {
+        case .loaded(let dict): store = dict
+        case .empty: store = [:]
+        case .failed(let reason):
+            log.error("[persistRefreshed] REFUSED: store unreadable (\(reason)); cannot persist rotated creds for \(accountId)")
+            return false
+        }
         guard let backup = store[accountId] else {
             log.error("[persistRefreshed] No backup for \(accountId) — cannot persist rotated creds")
             return false

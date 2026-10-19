@@ -22,6 +22,7 @@
 "5 minutes" = "5 分钟";
 "10 minutes" = "10 分钟";
 "Show account name in menu bar" = "在菜单栏显示账户名称";
+"Show head icon in menu bar" = "在菜单栏显示头像图标";
 "Show full email address" = "显示完整邮箱地址";
 "Launch at login" = "登录时启动";
 
@@ -130,6 +131,8 @@
 "Could not capture credentials" = "无法获取凭据";
 "No stored credentials for %@. Use re-authenticate to fix." = "没有 %@ 的存储凭据。请使用重新认证来修复。";
 "Logged in as %@, but expected %@. Credentials not updated." = "登录账户为 %1$@，但预期为 %2$@。凭据未更新。";
+"Claude CLI is authenticating via %@ instead of a stored claude.ai login, so it reports no account. Unset ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_PROFILE and remove any apiKeyHelper, then try again." = "Claude CLI 正在通过 %@ 进行认证，而不是使用已保存的 claude.ai 登录，因此不会报告账号。请取消 ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_PROFILE，并移除所有 apiKeyHelper，然后重试。";
+"Switched to %@, but the Claude CLI is authenticating via %@ instead of the stored login, so it will not use this account." = "已切换到 %1$@，但 Claude CLI 正在通过 %2$@ 认证，而不是使用已保存的登录，因此不会使用此账号。";
 "Token expired. Switch to refresh." = "令牌已过期。切换以刷新。";
 "Token expired. Switch to this account to refresh." = "令牌已过期。切换到此账户以刷新。";
 "API Rate Limited. Try again later." = "API 请求频率受限。请稍后重试。";
@@ -138,3 +141,40 @@
 /* Promo */
 "%@ - %@ (Weekdays) & Weekends" = "%1$@ - %2$@（工作日）及周末";
 "Double limits: 2 PM - 8 AM ET & Weekends" = "双倍额度：美东时间下午 2 点 - 上午 8 点及周末";
+
+/* Menu Bar */
+"Menu bar" = "菜单栏";
+"Menu bar modules" = "菜单栏模块";
+"Drag to reorder, toggle to enable. Disabled modules sit at the bottom." = "拖动排序，勾选启用。未启用的模块排在下方。";
+"Preview" = "预览";
+"Customize limit bar colors" = "自定义额度条颜色";
+"Warns when this much quota or less is left. At 30%, bars turn at 70% used." = "剩余额度低于这个比例时变为警告色。设为 30% 表示用量达到 70% 时变色。";
+"Limit bars" = "额度条";
+"Session bar color" = "会话条颜色";
+"Weekly bar color" = "每周条颜色";
+"Low remaining color" = "低剩余额度颜色";
+"Low remaining threshold" = "低剩余额度阈值";
+"Account name" = "账户名称";
+"Session usage (5h)" = "会话用量（5小时）";
+"Weekly usage (7d)" = "每周用量（7天）";
+"Daily cost" = "今日花费";
+"Session reset countdown" = "会话重置倒计时";
+"Weekly reset countdown" = "每周重置倒计时";
+"Menu Bar" = "菜单栏";
+"Account display" = "账户显示";
+"Session — usage vs time (5h)" = "会话 — 用量 vs 时间（5小时）";
+"Weekly — usage vs time (7d)" = "每周 — 用量 vs 时间（7天）";
+"The vertical line marks time elapsed in the window; fill past it means you're using faster than the clock." = "竖线 = 时间进度（该时段已过去多少）；填充超过它 = 你用得比时间快。";
+"Claude Fable 5 — most powerful model, the new flagship tier" = "Claude Fable 5 — 最强大的模型，全新旗舰层级";
+
+/* Auto-switch & rate-limit resilience */
+"Waiting for usage data..." = "正在等待用量数据...";
+"No active subscription on this account (OAuth not allowed)." = "该账户没有有效订阅（不允许 OAuth）。";
+"Session expired. Re-authenticate (↻) to fix." = "会话已过期。请重新认证（↻）来修复。";
+"Auto-switch" = "自动切换";
+"Switch account before hitting the limit" = "在达到限额前切换账户";
+"Switch at" = "切换阈值";
+"When the active account's 5-hour or weekly usage reaches this level, CCSwitcher switches to the account with the most quota left. Checked on every refresh; a 5-minute cooldown prevents rapid flip-flopping." = "当活跃账户的 5 小时或每周用量达到此水平时，CCSwitcher 会切换到剩余配额最多的账户。每次刷新时检查；5 分钟冷却时间可防止频繁来回切换。";
+"Updated %@ ago" = "%@前更新";
+"Could not save the refreshed sign-in; will retry automatically." = "无法保存刷新后的登录凭据；将自动重试。";
+"Credential storage is temporarily unavailable. Try again shortly." = "凭据存储暂时不可用。请稍后重试。";

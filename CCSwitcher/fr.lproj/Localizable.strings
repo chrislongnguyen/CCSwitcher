@@ -22,6 +22,7 @@
 "5 minutes" = "5 minutes";
 "10 minutes" = "10 minutes";
 "Show account name in menu bar" = "Afficher le nom du compte dans la barre des menus";
+"Show head icon in menu bar" = "Afficher l'icône de tête dans la barre des menus";
 "Show full email address" = "Afficher l'adresse e-mail complète";
 "Launch at login" = "Lancer au démarrage";
 
@@ -130,6 +131,8 @@
 "Could not capture credentials" = "Impossible de récupérer les identifiants";
 "No stored credentials for %@. Use re-authenticate to fix." = "Aucun identifiant enregistré pour %@. Utilisez la réauthentification pour corriger.";
 "Logged in as %@, but expected %@. Credentials not updated." = "Connecté en tant que %1$@, mais %2$@ était attendu. Identifiants non mis à jour.";
+"Claude CLI is authenticating via %@ instead of a stored claude.ai login, so it reports no account. Unset ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_PROFILE and remove any apiKeyHelper, then try again." = "Claude CLI s'authentifie via %@ au lieu d'une connexion claude.ai enregistrée et ne signale donc aucun compte. Supprimez ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_PROFILE ainsi que tout apiKeyHelper, puis réessayez.";
+"Switched to %@, but the Claude CLI is authenticating via %@ instead of the stored login, so it will not use this account." = "Basculé vers %1$@, mais Claude CLI s'authentifie via %2$@ au lieu de la connexion enregistrée et n'utilisera donc pas ce compte.";
 "Token expired. Switch to refresh." = "Jeton expiré. Basculez pour actualiser.";
 "Token expired. Switch to this account to refresh." = "Jeton expiré. Basculez vers ce compte pour actualiser.";
 "API Rate Limited. Try again later." = "Limite de l'API atteinte. Réessayez plus tard.";
@@ -138,3 +141,40 @@
 /* Promo */
 "%@ - %@ (Weekdays) & Weekends" = "%1$@ - %2$@ (Jours ouvrables) & Week-ends";
 "Double limits: 2 PM - 8 AM ET & Weekends" = "Limites doublées : 14h - 8h ET & week-ends";
+
+/* Menu Bar */
+"Menu bar" = "Barre de menus";
+"Menu bar modules" = "Modules de la barre de menus";
+"Drag to reorder, toggle to enable. Disabled modules sit at the bottom." = "Glissez pour réorganiser, basculez pour activer. Les modules désactivés sont en bas.";
+"Preview" = "Aperçu";
+"Customize limit bar colors" = "Personnaliser les couleurs des barres";
+"Warns when this much quota or less is left. At 30%, bars turn at 70% used." = "Avertit lorsqu'il ne reste que ce pourcentage. À 30%, les barres changent à 70% d'utilisation.";
+"Limit bars" = "Barres de limite";
+"Session bar color" = "Couleur de la barre session";
+"Weekly bar color" = "Couleur de la barre hebdo";
+"Low remaining color" = "Couleur de reste faible";
+"Low remaining threshold" = "Seuil de reste faible";
+"Account name" = "Nom du compte";
+"Session usage (5h)" = "Utilisation de la session (5h)";
+"Weekly usage (7d)" = "Utilisation hebdomadaire (7j)";
+"Daily cost" = "Coût quotidien";
+"Session reset countdown" = "Compte à rebours réinitialisation session";
+"Weekly reset countdown" = "Compte à rebours réinitialisation semaine";
+"Menu Bar" = "Barre de menus";
+"Account display" = "Affichage du compte";
+"Session — usage vs time (5h)" = "Session — usage vs temps (5 h)";
+"Weekly — usage vs time (7d)" = "Hebdomadaire — usage vs temps (7 j)";
+"The vertical line marks time elapsed in the window; fill past it means you're using faster than the clock." = "La ligne verticale indique le temps écoulé ; remplissage au-delà = consommation plus rapide que l'horloge.";
+"Claude Fable 5 — most powerful model, the new flagship tier" = "Claude Fable 5 — le modèle le plus puissant, le nouveau niveau phare";
+
+/* Auto-switch & rate-limit resilience */
+"Waiting for usage data..." = "En attente des données d'utilisation...";
+"No active subscription on this account (OAuth not allowed)." = "Aucun abonnement actif sur ce compte (OAuth non autorisé).";
+"Session expired. Re-authenticate (↻) to fix." = "Session expirée. Réauthentifiez-vous (↻) pour corriger.";
+"Auto-switch" = "Changement automatique";
+"Switch account before hitting the limit" = "Changer de compte avant d'atteindre la limite";
+"Switch at" = "Changer à";
+"When the active account's 5-hour or weekly usage reaches this level, CCSwitcher switches to the account with the most quota left. Checked on every refresh; a 5-minute cooldown prevents rapid flip-flopping." = "Lorsque l'utilisation sur 5 heures ou hebdomadaire du compte actif atteint ce niveau, CCSwitcher bascule vers le compte disposant du plus de quota restant. Vérifié à chaque actualisation ; un délai de 5 minutes évite les allers-retours rapides.";
+"Updated %@ ago" = "Mis à jour il y a %@";
+"Could not save the refreshed sign-in; will retry automatically." = "Impossible d'enregistrer les identifiants actualisés ; nouvelle tentative automatique.";
+"Credential storage is temporarily unavailable. Try again shortly." = "Le stockage des identifiants est temporairement indisponible. Réessayez dans un instant.";

@@ -22,6 +22,7 @@
 "5 minutes" = "5 minutes";
 "10 minutes" = "10 minutes";
 "Show account name in menu bar" = "Show account name in menu bar";
+"Show head icon in menu bar" = "Show head icon in menu bar";
 "Show full email address" = "Show full email address";
 "Launch at login" = "Launch at login";
 
@@ -130,6 +131,8 @@
 "Could not capture credentials" = "Could not capture credentials";
 "No stored credentials for %@. Use re-authenticate to fix." = "No stored credentials for %@. Use re-authenticate to fix.";
 "Logged in as %@, but expected %@. Credentials not updated." = "Logged in as %1$@, but expected %2$@. Credentials not updated.";
+"Claude CLI is authenticating via %@ instead of a stored claude.ai login, so it reports no account. Unset ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_PROFILE and remove any apiKeyHelper, then try again." = "Claude CLI is authenticating via %@ instead of a stored claude.ai login, so it reports no account. Unset ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_PROFILE and remove any apiKeyHelper, then try again.";
+"Switched to %@, but the Claude CLI is authenticating via %@ instead of the stored login, so it will not use this account." = "Switched to %1$@, but the Claude CLI is authenticating via %2$@ instead of the stored login, so it will not use this account.";
 "Token expired. Switch to refresh." = "Token expired. Switch to refresh.";
 "Token expired. Switch to this account to refresh." = "Token expired. Switch to this account to refresh.";
 "API Rate Limited. Try again later." = "API Rate Limited. Try again later.";
@@ -142,3 +145,40 @@
 /* About */
 "More apps at xueshi.dev" = "More apps at xueshi.dev";
 "© 2026 Xueshi Qiao" = "© 2026 Xueshi Qiao";
+
+/* Menu Bar */
+"Menu bar" = "Menu bar";
+"Menu bar modules" = "Menu bar modules";
+"Drag to reorder, toggle to enable. Disabled modules sit at the bottom." = "Drag to reorder, toggle to enable. Disabled modules sit at the bottom.";
+"Preview" = "Preview";
+"Customize limit bar colors" = "Customize limit bar colors";
+"Warns when this much quota or less is left. At 30%, bars turn at 70% used." = "Warns when this much quota or less is left. At 30%, bars turn at 70% used.";
+"Limit bars" = "Limit bars";
+"Session bar color" = "Session bar color";
+"Weekly bar color" = "Weekly bar color";
+"Low remaining color" = "Low remaining color";
+"Low remaining threshold" = "Low remaining threshold";
+"Account name" = "Account name";
+"Session usage (5h)" = "Session usage (5h)";
+"Weekly usage (7d)" = "Weekly usage (7d)";
+"Daily cost" = "Daily cost";
+"Session reset countdown" = "Session reset countdown";
+"Weekly reset countdown" = "Weekly reset countdown";
+"Menu Bar" = "Menu Bar";
+"Account display" = "Account display";
+"Session — usage vs time (5h)" = "Session — usage vs time (5h)";
+"Weekly — usage vs time (7d)" = "Weekly — usage vs time (7d)";
+"The vertical line marks time elapsed in the window; fill past it means you're using faster than the clock." = "The vertical line marks time elapsed in the window; fill past it means you're using faster than the clock.";
+"Claude Fable 5 — most powerful model, the new flagship tier" = "Claude Fable 5 — most powerful model, the new flagship tier";
+
+/* Auto-switch & rate-limit resilience */
+"Waiting for usage data..." = "Waiting for usage data...";
+"No active subscription on this account (OAuth not allowed)." = "No active subscription on this account (OAuth not allowed).";
+"Session expired. Re-authenticate (↻) to fix." = "Session expired. Re-authenticate (↻) to fix.";
+"Auto-switch" = "Auto-switch";
+"Switch account before hitting the limit" = "Switch account before hitting the limit";
+"Switch at" = "Switch at";
+"When the active account's 5-hour or weekly usage reaches this level, CCSwitcher switches to the account with the most quota left. Checked on every refresh; a 5-minute cooldown prevents rapid flip-flopping." = "When the active account's 5-hour or weekly usage reaches this level, CCSwitcher switches to the account with the most quota left. Checked on every refresh; a 5-minute cooldown prevents rapid flip-flopping.";
+"Updated %@ ago" = "Updated %@ ago";
+"Could not save the refreshed sign-in; will retry automatically." = "Could not save the refreshed sign-in; will retry automatically.";
+"Credential storage is temporarily unavailable. Try again shortly." = "Credential storage is temporarily unavailable. Try again shortly.";

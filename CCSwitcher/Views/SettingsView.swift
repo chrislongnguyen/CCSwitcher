@@ -5,11 +5,13 @@ import ServiceManagement
 struct SettingsView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var updateChecker: UpdateChecker
+    @EnvironmentObject private var menuBarConfig: MenuBarConfig
     @AppStorage("refreshInterval") private var refreshInterval: Double = 300
-    @AppStorage("showAccountName") private var showAccountName = true
     @AppStorage("showFullEmail") private var showFullEmail = false
     @AppStorage("showInDock") private var showInDock = false
     @AppStorage("appLanguage") private var appLanguage = "auto"
+    @AppStorage("autoSwitchEnabled") private var autoSwitchEnabled = false
+    @AppStorage("autoSwitchThreshold") private var autoSwitchThreshold = 90.0
     @State private var launchAtLogin = false
 
     var body: some View {
@@ -19,12 +21,22 @@ struct SettingsView: View {
                     Label("General", systemImage: "gear")
                 }
 
+            menuBarTab
+                .tabItem {
+                    Label("Menu Bar", systemImage: "menubar.rectangle")
+                }
+
+            ClaudeCLITabView()
+                .tabItem {
+                    Label("Claude CLI", systemImage: "terminal")
+                }
+
             aboutTab
                 .tabItem {
                     Label("About", systemImage: "info.circle")
                 }
         }
-        .frame(width: 450, height: 300)
+        .frame(width: 520, height: 440)
         .onAppear {
             launchAtLogin = SMAppService.mainApp.status == .enabled
         }
@@ -47,9 +59,30 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Appearance") {
-                Toggle("Show account name in menu bar", isOn: $showAccountName)
+            Section("Auto-switch") {
+                Toggle("Switch account before hitting the limit", isOn: $autoSwitchEnabled)
+                if autoSwitchEnabled {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Switch at")
+                            Spacer()
+                            Text("\(Int(autoSwitchThreshold))%")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $autoSwitchThreshold, in: 50...99, step: 1)
+                    }
+                    Text("When the active account's 5-hour or weekly usage reaches this level, CCSwitcher switches to the account with the most quota left. Checked on every refresh; a 5-minute cooldown prevents rapid flip-flopping.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("Account display") {
                 Toggle("Show full email address", isOn: $showFullEmail)
+            }
+
+            Section("Appearance") {
                 Picker("Language", selection: $appLanguage) {
                     Text("Automatic").tag("auto")
                     Divider()
@@ -69,6 +102,49 @@ struct SettingsView: View {
                     .onChange(of: launchAtLogin) { _, newValue in
                         toggleLaunchAtLogin(newValue)
                     }
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+
+    // MARK: - Menu Bar Tab
+
+    private var menuBarTab: some View {
+        Form {
+            Section("Appearance") {
+                Toggle("Show head icon in menu bar", isOn: $menuBarConfig.showsHeadIcon)
+            }
+
+            Section("Limit bars") {
+                Toggle("Customize limit bar colors", isOn: $menuBarConfig.customizesLimitBarColors)
+
+                // Collapsed while off, so the stock layout keeps the module list
+                // and its preview visible without scrolling.
+                if menuBarConfig.customizesLimitBarColors {
+                    ColorPicker("Session bar color", selection: sessionLimitBarColor, supportsOpacity: false)
+                    ColorPicker("Weekly bar color", selection: weeklyLimitBarColor, supportsOpacity: false)
+                    ColorPicker("Low remaining color", selection: lowRemainingLimitBarColor, supportsOpacity: false)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Low remaining threshold")
+                            Spacer()
+                            Text("\(Int(menuBarConfig.lowRemainingWarningThreshold))%")
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(value: $menuBarConfig.lowRemainingWarningThreshold, in: 0...100, step: 5)
+                        Text("Warns when this much quota or less is left. At 30%, bars turn at 70% used.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Section {
+                MenuBarModulesSettingsView()
+                    .environmentObject(appState)
             }
         }
         .formStyle(.grouped)
@@ -142,5 +218,41 @@ struct SettingsView: View {
         } catch {
             launchAtLogin = !enable // revert on failure
         }
+    }
+
+    private var sessionLimitBarColor: Binding<Color> {
+        colorBinding(
+            keyPath: \.sessionLimitBarColorHex,
+            fallback: MenuBarConfig.defaultSessionLimitBarColorHex
+        )
+    }
+
+    private var weeklyLimitBarColor: Binding<Color> {
+        colorBinding(
+            keyPath: \.weeklyLimitBarColorHex,
+            fallback: MenuBarConfig.defaultWeeklyLimitBarColorHex
+        )
+    }
+
+    private var lowRemainingLimitBarColor: Binding<Color> {
+        colorBinding(
+            keyPath: \.lowRemainingLimitBarColorHex,
+            fallback: MenuBarConfig.defaultLowRemainingLimitBarColorHex
+        )
+    }
+
+    private func colorBinding(keyPath: ReferenceWritableKeyPath<MenuBarConfig, String>, fallback: String) -> Binding<Color> {
+        Binding(
+            get: {
+                Color(hexRGB: menuBarConfig[keyPath: keyPath])
+                    ?? Color(hexRGB: fallback)
+                    ?? .brand
+            },
+            set: { color in
+                if let hex = color.hexRGB {
+                    menuBarConfig[keyPath: keyPath] = hex
+                }
+            }
+        )
     }
 }

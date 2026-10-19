@@ -45,10 +45,18 @@ struct Account: Identifiable, Codable, Hashable {
     }
 
     var obfuscatedEmail: String {
-        return email.obfuscatedEmail()
+        // This field IS an address — mask structurally, no detection step, so
+        // non-ASCII/quoted/punycode/literal forms can never slip through.
+        return email.maskedAsEmailAddress()
     }
 
     var obfuscatedDisplayName: String {
+        // displayName is orgName ?? email: when it IS the email, mask it
+        // structurally like the email field; otherwise treat it as free text
+        // and only mask what the conservative detector recognizes.
+        if displayName == email {
+            return email.maskedAsEmailAddress()
+        }
         return displayName.obfuscatedEmail()
     }
 
@@ -98,9 +106,21 @@ struct Account: Identifiable, Codable, Hashable {
 
 // MARK: - Auth Status (from `claude auth status`)
 
-/// Since v2.1.139, `claude auth status` returns ONLY `{loggedIn, authMethod, apiProvider}`.
-/// Identity fields (email, orgId, orgName, subscriptionType) are no longer present.
-/// Use `OAuthIdentity` (from `~/.claude.json` `oauthAccount`) for identity instead.
+/// Decoded `claude auth status` output.
+///
+/// The CLI only emits `email`, `orgId`, `orgName` and `subscriptionType` when
+/// `authMethod == "claude.ai"` — that is, when the stored claude.ai login is the
+/// credential source it actually resolves to. Any higher-precedence source
+/// shadows the stored login and the whole identity block is omitted while
+/// `loggedIn` stays `true`: an `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN`
+/// environment variable, an `apiKeyHelper`, an OAuth token file, an Anthropic
+/// profile in `~/.config/anthropic`, or a third-party provider (Bedrock, Vertex,
+/// …). Callers must therefore treat a missing `email` as "identity unavailable",
+/// never as "a different account is active".
+///
+/// Identity is read from `OAuthIdentity` (`~/.claude.json` `oauthAccount`), not from
+/// this struct: since Claude Code v2.1.139 `claude auth status` may omit the identity
+/// fields entirely.
 struct AuthStatus: Codable {
     let loggedIn: Bool
     let authMethod: String?
@@ -111,6 +131,18 @@ struct AuthStatus: Codable {
     let orgId: String?
     let orgName: String?
     let subscriptionType: String?
+
+    /// True when the CLI reports the identity of the stored claude.ai login,
+    /// i.e. when `email` is meaningful.
+    var reportsClaudeAiIdentity: Bool {
+        authMethod == "claude.ai"
+    }
+
+    /// The credential source shadowing the stored claude.ai login, or `nil` when
+    /// nothing shadows it. Only meaningful while `loggedIn` is `true`.
+    var shadowingAuthMethod: String? {
+        reportsClaudeAiIdentity ? nil : (authMethod ?? "unknown")
+    }
 }
 
 // MARK: - OAuth Identity (from `~/.claude.json` `oauthAccount`)

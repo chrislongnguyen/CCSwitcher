@@ -14,11 +14,17 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    # Pin to macos-26 (Tahoe) so binaries are built against the macOS 26
+    # SDK — same as developer's local environment. `macos-latest` resolves
+    # to macos-15 (Sequoia) at time of writing, which still triggers
+    # SwiftUI behavior-compat shims for MenuBarExtra panel sizing when the
+    # binary is run on Tahoe.
+    runs-on: macos-26
     
     # Only run notarization if the secrets are available (e.g. not on forks)
     env:
       HAS_APPLE_SECRETS: ${{ secrets.MAC_CERTS_P12_BASE64 != '' }}
+      HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_EDDSA_KEY != '' }}
 
     steps:
       - name: Checkout repository
@@ -27,7 +33,10 @@ jobs:
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '16.1'
+          # latest-stable picks the newest GA Xcode preinstalled on the
+          # runner, which matches the developer's local SDK and avoids
+          # SDK-skew SwiftUI compat shims on newer host OS versions.
+          xcode-version: 'latest-stable'
 
       - name: Install Build Tools
         run: brew install xcodegen create-dmg
@@ -76,18 +85,44 @@ jobs:
       - name: Sign App
         if: ${{ env.HAS_APPLE_SECRETS == 'true' }}
         run: |
-          # Sign nested extensions first (inside-out), then the main app.
-          # All bundles need --options runtime for notarization.
+          # Order matters: every nested binary inside Sparkle.framework must be
+          # signed BEFORE the framework itself, otherwise sealing the framework
+          # captures unsigned content and `codesign --verify --deep --strict`
+          # reports "nested code is modified or invalid". An earlier find-based
+          # walk had the wrong order plus symlink double-signing problems; the
+          # explicit list below matches Sparkle's own distribution recipe.
+          # `--preserve-metadata=entitlements` keeps each helper's bundled
+          # entitlements (we must not clobber Sparkle's installer entitlements).
+          APP=build/Release/CCSwitcher.app
+          IDENTITY="Developer ID Application"
+          SPARKLE_V="$APP/Contents/Frameworks/Sparkle.framework/Versions/B"
 
-          # 1. Sign the widget extension with its own entitlements
-          codesign --force --options runtime --sign "Developer ID Application" --timestamp \
+          for nested in \
+            "$SPARKLE_V/XPCServices/Downloader.xpc" \
+            "$SPARKLE_V/XPCServices/Installer.xpc" \
+            "$SPARKLE_V/Updater.app" \
+            "$SPARKLE_V/Autoupdate" \
+            "$APP/Contents/Frameworks/Sparkle.framework"; do
+            if [ -e "$nested" ]; then
+              codesign --force --options runtime --timestamp \
+                --sign "$IDENTITY" \
+                --preserve-metadata=identifier,entitlements,flags \
+                "$nested"
+            fi
+          done
+
+          # Widget extension with its own entitlements file
+          codesign --force --options runtime --sign "$IDENTITY" --timestamp \
             --entitlements CCSwitcherWidget/Resources/CCSwitcherWidget.entitlements \
-            build/Release/CCSwitcher.app/Contents/Extensions/CCSwitcherWidgetExtension.appex
+            "$APP/Contents/Extensions/CCSwitcherWidgetExtension.appex"
 
-          # 2. Sign the main app bundle
-          codesign --force --options runtime --sign "Developer ID Application" --timestamp \
+          # Main app
+          codesign --force --options runtime --sign "$IDENTITY" --timestamp \
             --entitlements CCSwitcher/Resources/CCSwitcher.entitlements \
-            build/Release/CCSwitcher.app
+            "$APP"
+
+          # Verify everything is correctly sealed for notarization
+          codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Create DMG
         run: |
@@ -130,6 +165,145 @@ jobs:
           cd build/Release
           xcrun stapler staple CCSwitcher.dmg
 
+      - name: Download Sparkle tools
+        if: ${{ env.HAS_SPARKLE_KEY == 'true' && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          SPARKLE_VERSION="2.9.0"
+          curl -sL -o "$RUNNER_TEMP/sparkle.tar.xz" \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+
+      - name: Prepare release notes
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          MD="$RUNNER_TEMP/release_notes.md"
+          HTML="$RUNNER_TEMP/release_notes.html"
+
+          # Single source of truth: the committed RELEASE_NOTES.md (written by
+          # the /release flow before tagging). Fall back to GitHub's generated
+          # notes, then git log, so a release is never note-less.
+          if [ -f RELEASE_NOTES.md ]; then
+            cp RELEASE_NOTES.md "$MD"
+          else
+            PREV_TAG=$(git tag -l 'v*' --sort=-v:refname | grep -v "${GITHUB_REF_NAME}" | head -1 || true)
+            NOTES=""
+            if [ -n "$PREV_TAG" ]; then
+              NOTES=$(gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+                -f tag_name="${GITHUB_REF_NAME}" -f previous_tag_name="${PREV_TAG}" \
+                --jq '.body' 2>/dev/null || true)
+              if [ -z "$NOTES" ]; then
+                NOTES=$(git log "${PREV_TAG}..HEAD" --pretty=format:'- %s' --no-merges 2>/dev/null || true)
+              fi
+            fi
+            [ -z "$NOTES" ] && NOTES="Bug fixes and improvements."
+            printf '%s\n' "$NOTES" > "$MD"
+          fi
+
+          # Render to GitHub-flavored HTML for the Sparkle update dialog.
+          if ! gh api --method POST /markdown -f mode=gfm -f text="$(cat "$MD")" > "$HTML" 2> "$RUNNER_TEMP/md_err.log" || [ ! -s "$HTML" ]; then
+            echo "WARN: gh /markdown render failed; using escaped <pre> fallback. gh stderr:"
+            cat "$RUNNER_TEMP/md_err.log" 2>/dev/null || true
+            python3 -c 'import html,sys; print("<pre>"+html.escape(open(sys.argv[1]).read())+"</pre>")' "$MD" > "$HTML"
+          fi
+
+          echo "--- release_notes.html ---"
+          cat "$HTML"
+
+      - name: Sign DMG with Sparkle EdDSA + generate appcast.xml
+        if: ${{ env.HAS_SPARKLE_KEY == 'true' && startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          SPARKLE_EDDSA_KEY: ${{ secrets.SPARKLE_EDDSA_KEY }}
+        run: |
+          set -e
+          cd build/Release
+
+          # Sparkle's sign_update expects the base64 of the raw 32-byte Ed25519
+          # seed. If the user accidentally stored the longer 64-byte seed+public
+          # concatenation as the secret, strip back to the first 32 bytes. The
+          # public half of the libsodium "secret key" can always be re-derived
+          # from the seed, so dropping it is lossless.
+          KEY_FILE=$(mktemp)
+          DECODED_LEN=$(printf '%s' "$SPARKLE_EDDSA_KEY" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+          case "$DECODED_LEN" in
+            32)
+              printf '%s' "$SPARKLE_EDDSA_KEY" > "$KEY_FILE"
+              ;;
+            64)
+              echo "Note: SPARKLE_EDDSA_KEY decoded to 64 bytes; truncating to first 32 (raw seed) for sign_update."
+              printf '%s' "$SPARKLE_EDDSA_KEY" | base64 -d | head -c 32 | base64 > "$KEY_FILE"
+              ;;
+            *)
+              echo "ERROR: SPARKLE_EDDSA_KEY decoded length is $DECODED_LEN bytes; expected 32 or 64."
+              rm -f "$KEY_FILE"
+              exit 1
+              ;;
+          esac
+
+          # Capture both stdout and stderr so any sign_update failure surfaces
+          # in the action log instead of being swallowed by $() substitution.
+          if ! SIGN_OUTPUT=$("$RUNNER_TEMP/sparkle/bin/sign_update" CCSwitcher.dmg -f "$KEY_FILE" 2>&1); then
+            echo "ERROR: sign_update exited non-zero. Output:"
+            echo "$SIGN_OUTPUT"
+            rm -f "$KEY_FILE"
+            exit 1
+          fi
+          rm -f "$KEY_FILE"
+
+          echo "sign_update output: $SIGN_OUTPUT"
+          ED_SIGNATURE=$(echo "$SIGN_OUTPUT" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
+          if [ -z "$ED_SIGNATURE" ]; then
+            echo "ERROR: could not parse sparkle:edSignature from sign_update output"
+            exit 1
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Anchor the grep so it picks the SETTING line (e.g. `CURRENT_PROJECT_VERSION: "49"`)
+          # and skips reference lines like `CFBundleVersion: $(CURRENT_PROJECT_VERSION)`.
+          BUILD=$(grep -E '^\s*CURRENT_PROJECT_VERSION: ' ../../project.yml | head -1 | awk -F'"' '{print $2}')
+          if [ -z "$BUILD" ]; then
+            echo "ERROR: failed to parse CURRENT_PROJECT_VERSION from project.yml"
+            exit 1
+          fi
+          FILE_LENGTH=$(stat -f%z CCSwitcher.dmg)
+          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/CCSwitcher.dmg"
+          PUB_DATE=$(date -u +"%a, %d %b %Y %H:%M:%S +0000")
+
+          # Read the rendered notes (Prepare release notes step). Build the
+          # appcast with an echo block instead of a heredoc so the HTML never
+          # gets shell-expanded inside the CDATA section.
+          # Neutralize any literal CDATA terminator in the rendered HTML so a
+          # release note containing `]]>` (e.g. a code snippet) can't break the
+          # appcast XML.
+          RELEASE_NOTES_HTML=$(sed 's/]]>/]]\&gt;/g' "$RUNNER_TEMP/release_notes.html")
+          {
+            echo '<?xml version="1.0" encoding="utf-8"?>'
+            echo '<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">'
+            echo '  <channel>'
+            echo '    <title>CCSwitcher Updates</title>'
+            echo "    <link>https://github.com/${GITHUB_REPOSITORY}/releases.atom</link>"
+            echo '    <item>'
+            echo "      <title>Version ${VERSION}</title>"
+            echo "      <description><![CDATA[${RELEASE_NOTES_HTML}]]></description>"
+            echo "      <pubDate>${PUB_DATE}</pubDate>"
+            echo "      <sparkle:version>${BUILD}</sparkle:version>"
+            echo "      <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>"
+            echo '      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>'
+            echo "      <enclosure url=\"${DOWNLOAD_URL}\" length=\"${FILE_LENGTH}\" type=\"application/octet-stream\" sparkle:edSignature=\"${ED_SIGNATURE}\" />"
+            echo '    </item>'
+            echo '  </channel>'
+            echo '</rss>'
+          } > appcast.xml
+
+          echo "Generated appcast.xml:"
+          cat appcast.xml
+
+          # Never publish a malformed Sparkle feed: fail the build instead.
+          xmllint --noout appcast.xml
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -165,9 +339,14 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
+          body_path: ${{ runner.temp }}/release_notes.md
+          # appcast.xml is only produced when the Sparkle key is present; don't
+          # fail the release if it (or any listed file) is absent.
+          fail_on_unmatched_files: false
           files: |
             build/Release/CCSwitcher.dmg
             build/Release/latest.json
+            build/Release/appcast.xml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -176,6 +355,6 @@ jobs:
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.HOMEBREW_TAP_PAT }}
-          repository: XueshiQiao/homebrew_tap
+          repository: XueshiQiao/homebrew-tap
           event-type: update_cask
           client-payload: '{"app_token": "ccswitcher"}'
