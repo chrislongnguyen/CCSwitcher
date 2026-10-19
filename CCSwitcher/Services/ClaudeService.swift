@@ -27,6 +27,11 @@ final class ClaudeService: @unchecked Sendable {
         return _claudePath
     }
 
+    /// Token-refresh strategy. Option A (direct OAuth grant) by default; swap to an
+    /// Option B implementation here if the edge starts attestation-blocking (HTTP 403
+    /// 1010). See ARCHITECTURE.md §Token Lifecycle & Refresh.
+    let refresher: any TokenRefreshing = DirectTokenRefresher()
+
     private init() {
         let preference = UserDefaults.standard.string(forKey: kClaudeBinaryPathPreferenceKey) ?? ""
         if !preference.isEmpty, FileManager.default.isExecutableFile(atPath: preference) {
@@ -203,7 +208,7 @@ final class ClaudeService: @unchecked Sendable {
             throw ClaudeServiceError.invalidOutput
         }
         let status = try JSONDecoder().decode(AuthStatus.self, from: data)
-        log.info("[getAuthStatus] loggedIn=\(status.loggedIn), provider=\(status.apiProvider ?? "nil"), sub=\(status.subscriptionType ?? "nil")")
+        log.info("[getAuthStatus] loggedIn=\(status.loggedIn), method=\(status.authMethod ?? "nil"), provider=\(status.apiProvider ?? "nil")")
         return status
     }
 
@@ -272,111 +277,107 @@ final class ClaudeService: @unchecked Sendable {
         }
     }
 
-    // MARK: - OAuth refresh (direct token endpoint, no keychain swap)
-
-    /// Claude Code's public OAuth client id (PKCE public client - not a secret).
-    private static let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    private static let oauthTokenURL = "https://console.anthropic.com/v1/oauth/token"
-
-    /// Outcome of an OAuth refresh attempt. The `rejected`/`transient`
-    /// distinction is load-bearing for the caller: `rejected` means the refresh
-    /// token is dead and only re-authentication helps, while `transient` says
-    /// nothing about the token at all — showing "re-authenticate" for a network
-    /// blip would send the user through a pointless login.
-    enum OAuthRefreshResult {
-        case success(String)
-        /// The endpoint (or the stored credential itself) says this grant can
-        /// never work: no refresh token stored, or a 4xx rejection.
-        case rejected
-        /// Network trouble or a server-side error; the token's validity is unknown.
-        case transient
+    /// Extract access token string from a token JSON (keychain format)
+    static func extractAccessToken(from tokenJSON: String) -> String? {
+        return oauthField(from: tokenJSON, key: "accessToken") as? String
     }
 
-    /// Silently refresh a credential JSON using its refresh token, via a direct
-    /// POST to the OAuth token endpoint. Never touches the keychain - safe to run
-    /// for non-active accounts while Claude Code sessions are working, because
-    /// only CCSwitcher holds these backups (rotation cannot race anyone).
-    func refreshOAuthCredentials(_ credentialsJSON: String) async -> OAuthRefreshResult {
-        guard var root = (try? JSONSerialization.jsonObject(with: Data(credentialsJSON.utf8))) as? [String: Any],
-              var oauth = root["claudeAiOauth"] as? [String: Any],
-              let refreshToken = oauth["refreshToken"] as? String, !refreshToken.isEmpty,
-              let url = URL(string: Self.oauthTokenURL)
-        else {
-            log.warning("[refreshOAuth] Stored credential has no refresh token")
-            return .rejected
-        }
+    /// Extract the refresh token from a token JSON. Needed to drive the refresh grant.
+    static func extractRefreshToken(from tokenJSON: String) -> String? {
+        return oauthField(from: tokenJSON, key: "refreshToken") as? String
+    }
 
+    /// Extract `expiresAt` (epoch ms) from a token JSON. Used to decide proactive refresh.
+    /// Tolerates Int or Double encodings.
+    static func extractExpiresAt(from tokenJSON: String) -> Double? {
+        switch oauthField(from: tokenJSON, key: "expiresAt") {
+        case let d as Double: return d
+        case let i as Int:    return Double(i)
+        default:              return nil
+        }
+    }
+
+    private static func oauthField(from tokenJSON: String, key: String) -> Any? {
+        guard let data = tokenJSON.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any] else {
+            return nil
+        }
+        return oauth[key]
+    }
+
+    // MARK: - Cloud-feature scope probe
+
+    /// Result of probing whether a token has the modern OAuth scopes required
+    /// for Claude Code on the web (e.g. /ultraplan, /ultrareview, remote sessions).
+    enum ScopeProbeResult: Sendable {
+        /// Token is valid and has cloud-session scopes.
+        case ok
+        /// Token authenticates but lacks the scopes for cloud features.
+        /// Re-authentication is required (refresh_token cannot upgrade scopes per OAuth 2.0).
+        case staleScope
+        /// Server rejected the token (401). Refresh token expired or was rotated/revoked
+        /// while this snapshot was sitting in CCSwitcher's backup. Re-auth required;
+        /// proceeding would corrupt the live keychain with a token the API will refuse.
+        case expired
+        /// Network or transient error. Caller should fall through, not block.
+        case transientError
+    }
+
+    /// Probes /v1/environment_providers to determine whether `accessToken` has
+    /// the modern OAuth scopes Claude Code's cloud features require.
+    /// Read-only HTTPS GET; no side effects on Anthropic side.
+    /// Throws `CancellationError` if the surrounding Task is cancelled — never
+    /// swallows cancellation as a "transient" outcome.
+    func probeCloudScopes(accessToken: String) async throws -> ScopeProbeResult {
+        guard let url = URL(string: "https://api.anthropic.com/v1/environment_providers") else {
+            return .transientError
+        }
         var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "grant_type": "refresh_token",
-            "refresh_token": refreshToken,
-            "client_id": Self.oauthClientID,
-        ])
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.timeoutInterval = 8
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard status == 200,
-                  let resp = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let accessToken = resp["access_token"] as? String,
-                  let expiresIn = resp["expires_in"] as? Double
-            else {
-                // NEVER log the response body. This guard also fires when the
-                // status IS 200 but a field failed to parse (schema change) —
-                // in that case the body is a *successful* token response whose
-                // first bytes are a live access token, headed for a log file
-                // that outlives rotation and gets attached to bug reports.
-                // Log the status plus an allowlisted OAuth error code only.
-                let oauthError = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["error"] as? String
-                let knownCodes = ["invalid_grant", "invalid_request", "invalid_client", "unauthorized_client", "unsupported_grant_type", "invalid_scope"]
-                let loggedCode = oauthError.map { knownCodes.contains($0) ? $0 : "unrecognized" } ?? "none"
-                log.warning("[refreshOAuth] Refresh not applied (HTTP \(status), error=\(loggedCode), \(data.count) bytes)")
-
-                // A 200 that failed OUR parse is a schema change, not a dead
-                // grant. Otherwise only a grant-terminal OAuth error means the
-                // refresh token is dead (RFC 6749 §5.2: `invalid_grant` covers
-                // expired/revoked/invalid refresh tokens). Everything else —
-                // 5xx, 429, 408, an `invalid_request` from a request-shape
-                // mismatch — says nothing about the token, and demanding
-                // re-authentication for it would be a pointless login.
-                if status == 200 { return .transient }
-                return oauthError == "invalid_grant" ? .rejected : .transient
+            guard let http = response as? HTTPURLResponse else {
+                log.warning("[probeCloudScopes] non-HTTP response, treating as transient")
+                return .transientError
             }
-
-            oauth["accessToken"] = accessToken
-            oauth["expiresAt"] = Int64(Date().timeIntervalSince1970 * 1000) + Int64(expiresIn * 1000)
-            if let newRefresh = resp["refresh_token"] as? String, !newRefresh.isEmpty {
-                oauth["refreshToken"] = newRefresh
+            switch http.statusCode {
+            case 200:
+                log.info("[probeCloudScopes] HTTP 200 — cloud scopes present")
+                return .ok
+            case 401:
+                // Server rejected the bearer. The snapshot CCSwitcher is about to write
+                // is already invalid — writing it would leave Claude Code in the 401
+                // loop the user is currently seeing. Halt and route to re-auth.
+                let body = String(data: data, encoding: .utf8) ?? ""
+                log.error("[probeCloudScopes] HTTP 401 — token expired/revoked. body=\(body.prefix(200))")
+                return .expired
+            case 403:
+                let body = String(data: data, encoding: .utf8) ?? ""
+                if body.contains("OAuth token does not meet scope requirement") {
+                    log.warning("[probeCloudScopes] HTTP 403 stale-scope — token needs re-auth")
+                    return .staleScope
+                }
+                // Future-proof: if Anthropic changes wording, surface the body so we can
+                // fix-forward. body.prefix(200) keeps the log line bounded.
+                log.warning("[probeCloudScopes] HTTP 403 (non-scope match) — body: \(body.prefix(200))")
+                return .transientError
+            default:
+                log.warning("[probeCloudScopes] HTTP \(http.statusCode) — transient")
+                return .transientError
             }
-            // `scopes` is deliberately NOT rewritten from the refresh response.
-            // The CLI (verified against claude 2.1.220) decides whether it
-            // recognises a stored login by checking that `scopes` contains
-            // "user:inference"; a refresh response carrying a narrower scope
-            // string would make this credential invisible to `claude auth
-            // status`, and the account would read as not-logged-in with no
-            // visible cause. The login-time value is the one to keep.
-            root["claudeAiOauth"] = oauth
-            let out = try JSONSerialization.data(withJSONObject: root)
-            log.info("[refreshOAuth] Access token refreshed, valid for \(Int(expiresIn / 3600))h \(Int(expiresIn.truncatingRemainder(dividingBy: 3600) / 60))m")
-            guard let json = String(data: out, encoding: .utf8) else { return .transient }
-            return .success(json)
+        } catch is CancellationError {
+            // Structured-concurrency contract: cancellation must propagate, never be
+            // swallowed as a "transient" outcome. Otherwise a cancelled probe could
+            // let switchAccount() proceed with an unverified token (DeepSeek finding #1).
+            throw CancellationError()
         } catch {
-            log.warning("[refreshOAuth] Refresh failed: \(error.localizedDescription)")
-            return .transient
+            log.warning("[probeCloudScopes] error: \(error.localizedDescription) — transient")
+            return .transientError
         }
-    }
-
-    /// Extract access token string from a token JSON (keychain format)
-    static func extractAccessToken(from tokenJSON: String) -> String? {
-        guard let data = tokenJSON.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let accessToken = oauth["accessToken"] as? String else {
-            return nil
-        }
-        return accessToken
     }
 
     // MARK: - Account Switching
@@ -415,9 +416,62 @@ final class ClaudeService: @unchecked Sendable {
         // 2. Target backup was resolved and validated by the caller.
         log.info("[switchAccount] Step 2: Using caller-resolved backup for target account")
 
+        // Token actually written to the keychain in Step 3. Starts as the stored backup
+        // token; if Step 2.5 refreshes an expired token, this is replaced with the fresh one.
+        var workingToken = targetBackup.token
+
+        // 2.5. Probe target token's cloud-feature scopes BEFORE writing to keychain.
+        // OAuth 2.0 cannot upgrade scopes via refresh_token — a token minted before
+        // a new scope existed will silently fail Claude Code's cloud features
+        // (e.g. /ultraplan returns "session creation failed"). On stale-scope, halt
+        // the swap so the user re-authenticates instead of writing a broken token.
+        // See AppState.reauthenticateAccount; UI is in AccountSwitcherView.swift:141.
+        log.info("[switchAccount] Step 2.5: Probing target token cloud scopes...")
+        if let probeAccessToken = ClaudeService.extractAccessToken(from: targetBackup.token) {
+            // `try` lets CancellationError propagate up; AppState.switchTo catches it
+            // and surfaces a clean error to the user instead of silently corrupting
+            // the live keychain entry with an unverified token.
+            switch try await probeCloudScopes(accessToken: probeAccessToken) {
+            case .ok:
+                log.info("[switchAccount] Step 2.5: cloud scopes OK")
+            case .staleScope:
+                log.error("[switchAccount] Step 2.5: stale-scope — halting swap before keychain write")
+                throw ClaudeServiceError.staleScope(email: targetAccount.email)
+            case .expired:
+                // NEW (2026-06-06): instead of halting, attempt a refresh-token grant.
+                // Anthropic refresh tokens rotate, so the access token expiring does NOT
+                // mean the account is dead — the stored refresh token may still mint a
+                // fresh access token. Only halt to re-auth if the refresh itself fails.
+                log.warning("[switchAccount] Step 2.5: access token expired — attempting refresh-grant")
+                guard let refreshTok = ClaudeService.extractRefreshToken(from: workingToken) else {
+                    log.error("[switchAccount] Step 2.5: no refresh token in backup — re-auth required")
+                    throw ClaudeServiceError.expiredToken(email: targetAccount.email)
+                }
+                do {
+                    let creds = try await refresher.refresh(refreshToken: refreshTok)
+                    // ROTATION-SAFETY: persist the rotated token to the backup store BEFORE
+                    // using it. isActive:false — target is not the live account until Step 3.
+                    guard keychain.persistRefreshedCreds(creds, forAccountId: targetAccount.id.uuidString, isActive: false),
+                          let refreshed = keychain.getAccountBackup(forAccountId: targetAccount.id.uuidString) else {
+                        log.error("[switchAccount] Step 2.5: refresh succeeded but persist/reread failed — re-auth required")
+                        throw ClaudeServiceError.expiredToken(email: targetAccount.email)
+                    }
+                    workingToken = refreshed.token
+                    log.info("[switchAccount] Step 2.5: refresh succeeded — proceeding with fresh token")
+                } catch let refreshErr as TokenRefreshError {
+                    log.error("[switchAccount] Step 2.5: refresh failed (\(refreshErr.localizedDescription)) — re-auth required")
+                    throw ClaudeServiceError.expiredToken(email: targetAccount.email)
+                }
+            case .transientError:
+                log.warning("[switchAccount] Step 2.5: probe inconclusive — proceeding (fail-open)")
+            }
+        } else {
+            log.warning("[switchAccount] Step 2.5: could not extract accessToken from backup, skipping probe")
+        }
+
         // 3. Write target token to keychain + target oauthAccount to ~/.claude.json
         log.info("[switchAccount] Step 3: Writing target credentials...")
-        guard keychain.writeClaudeToken(targetBackup.token) else {
+        guard keychain.writeClaudeToken(workingToken) else {
             log.error("[switchAccount] Step 3: Failed to write token to keychain!")
             throw ClaudeServiceError.keychainWriteFailed
         }
@@ -427,58 +481,44 @@ final class ClaudeService: @unchecked Sendable {
         }
         log.info("[switchAccount] Step 3: Both token and oauthAccount written")
 
-        // 4. Verify
-        log.info("[switchAccount] Step 4: Verifying with `claude auth status`...")
-        let status = try await getAuthStatus()
-        guard status.loggedIn else {
-            log.error("[switchAccount] Step 4: Not logged in after switch!")
+        // 4. Verify identity from ~/.claude.json (the file we just wrote in Step 3).
+        // We read it back directly — no subprocess needed. `claude auth status` can
+        // hang for 12+ seconds on expired tokens (internal refresh deadlock, exit 1)
+        // and is no longer the canonical identity source since v2.1.139.
+        log.info("[switchAccount] Step 4: Verifying identity from oauthAccount...")
+        guard let identity = KeychainService.shared.readOAuthIdentity() else {
+            log.error("[switchAccount] Step 4: Could not read oauthAccount identity after write")
             throw ClaudeServiceError.switchVerificationFailed
         }
-
-        if let email = status.email {
-            guard email == targetAccount.email else {
-                log.error("[switchAccount] Step 4: Logged in as \(email) instead of \(targetAccount.email)")
-                throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: email)
-            }
-            log.info("[switchAccount] Step 4: Switch verified — logged in as \(email)")
-            return SwitchOutcome(shadowedBy: nil)
+        if identity.emailAddress != targetAccount.email {
+            log.error("[switchAccount] Step 4: Identity mismatch — got \(identity.emailAddress), expected \(targetAccount.email)")
+            throw ClaudeServiceError.switchWrongAccount(expected: targetAccount.email, actual: identity.emailAddress)
         }
-
-        // No `email` in the status output. The CLI is logged in, but resolves to a
-        // credential source that outranks the stored claude.ai login (env token,
-        // apiKeyHelper, OAuth token file, Anthropic profile, third-party provider),
-        // so it omits the identity block entirely. That says nothing about whether
-        // our swap worked, so verify against the credentials we just wrote instead
-        // of reporting the target account as "wrong" (issue #18).
-        let shadowedBy = status.shadowingAuthMethod ?? "unknown"
-        log.warning("[switchAccount] Step 4: CLI reports authMethod=\(shadowedBy) and omits the account identity; verifying against the credential store instead")
-        guard credentialsOnDiskMatch(backup: targetBackup, email: targetAccount.email) else {
+        // D3: after a keychain write, confirm the keychain actually holds the token we
+        // wrote (the refreshed one if Step 2.5 rotated it) before reporting success.
+        guard keychainHolds(token: workingToken) else {
             throw ClaudeServiceError.switchVerificationFailed
         }
-        log.info("[switchAccount] Step 4: Switch verified against the credential store (CLI identity hidden by \(shadowedBy))")
-        return SwitchOutcome(shadowedBy: shadowedBy)
+        // No `claude auth status` check here: the subprocess reads the keychain via
+        // /usr/bin/security → user-facing popup on every switch, and it was already
+        // non-fatal dead weight (failed exit-1 on 2026-06-06 while the switch verified
+        // fine via the ~/.claude.json read above). Without it a credential source that
+        // shadows the stored login (env token, apiKeyHelper, …) cannot be detected
+        // here, so `shadowedBy` is always nil.
+        log.info("[switchAccount] Step 4: Switch verified — logged in as \(identity.emailAddress)")
+        return SwitchOutcome(shadowedBy: nil)
     }
 
-    /// Ground-truth check that does not depend on `claude auth status`: both
-    /// halves of a switch — the keychain token and the `~/.claude.json` identity —
-    /// must hold the target account.
-    private func credentialsOnDiskMatch(backup: AccountBackup, email: String) -> Bool {
-        let keychain = KeychainService.shared
-
-        guard let liveToken = keychain.readClaudeToken(),
-              let liveAccessToken = Self.extractAccessToken(from: liveToken),
-              let expectedAccessToken = Self.extractAccessToken(from: backup.token),
-              liveAccessToken == expectedAccessToken else {
-            log.error("[switchAccount] Keychain token does not match the target account's backup")
+    /// Ground-truth check that the live keychain holds `token`, compared by access
+    /// token so formatting differences in the stored JSON do not matter.
+    private func keychainHolds(token: String) -> Bool {
+        guard let live = KeychainService.shared.readClaudeToken(),
+              let liveAccess = Self.extractAccessToken(from: live),
+              let expectedAccess = Self.extractAccessToken(from: token),
+              liveAccess == expectedAccess else {
+            log.error("[switchAccount] Step 4: Keychain token does not match the token just written")
             return false
         }
-
-        guard let liveOAuth = keychain.readOAuthAccount(),
-              (liveOAuth["emailAddress"]?.value as? String) == email else {
-            log.error("[switchAccount] ~/.claude.json identity does not match \(email)")
-            return false
-        }
-
         return true
     }
 
@@ -704,6 +744,23 @@ enum ClaudeServiceError: LocalizedError {
     case oauthAccountWriteFailed
     case switchVerificationFailed
     case switchWrongAccount(expected: String, actual: String)
+    case staleScope(email: String)
+    case expiredToken(email: String)
+
+    /// D3 (ARCHITECTURE.md §Token Lifecycle): true ONLY for failures thrown after
+    /// switchAccount Step 3 began writing the live keychain. Rollback is destructive
+    /// for pre-write failures — restoring the backup over an untouched keychain
+    /// clobbered a fresh CLI login with a stale token (observed 2026-06-06 12:02:56).
+    var occurredAfterKeychainWrite: Bool {
+        switch self {
+        case .keychainWriteFailed, .oauthAccountWriteFailed,
+             .switchVerificationFailed, .switchWrongAccount:
+            return true
+        case .invalidOutput, .cliError, .processLaunchFailed,
+             .noTokenForAccount, .staleScope, .expiredToken:
+            return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -723,6 +780,10 @@ enum ClaudeServiceError: LocalizedError {
             return "Account switch verification failed"
         case .switchWrongAccount(let expected, let actual):
             return "Switch failed: expected \(expected) but got \(actual). Try removing and re-adding the account."
+        case .staleScope(let email):
+            return "\(email)'s saved token is too old for cloud features (e.g. /ultraplan). Click \"Re-authenticate\" on this account to fix."
+        case .expiredToken(let email):
+            return "\(email)'s saved token has expired (refresh token rotated or revoked since last capture). Click \"Re-authenticate\" on this account to fix — no terminal /login needed."
         }
     }
 }

@@ -117,10 +117,16 @@ struct Account: Identifiable, Codable, Hashable {
 /// profile in `~/.config/anthropic`, or a third-party provider (Bedrock, Vertex,
 /// …). Callers must therefore treat a missing `email` as "identity unavailable",
 /// never as "a different account is active".
+///
+/// Identity is read from `OAuthIdentity` (`~/.claude.json` `oauthAccount`), not from
+/// this struct: since Claude Code v2.1.139 `claude auth status` may omit the identity
+/// fields entirely.
 struct AuthStatus: Codable {
     let loggedIn: Bool
     let authMethod: String?
     let apiProvider: String?
+    // Deprecated since Claude Code v2.1.139 — these fields are always nil now.
+    // Retained for backward deserialization only.
     let email: String?
     let orgId: String?
     let orgName: String?
@@ -136,5 +142,49 @@ struct AuthStatus: Codable {
     /// nothing shadows it. Only meaningful while `loggedIn` is `true`.
     var shadowingAuthMethod: String? {
         reportsClaudeAiIdentity ? nil : (authMethod ?? "unknown")
+    }
+}
+
+// MARK: - OAuth Identity (from `~/.claude.json` `oauthAccount`)
+
+/// Structured identity read from `~/.claude.json`'s `oauthAccount` field.
+/// This is the canonical identity source since `claude auth status` stopped
+/// returning email/org/subscription in v2.1.139 (2026-05-11).
+struct OAuthIdentity: CustomStringConvertible {
+    let emailAddress: String
+    let displayName: String?
+    let organizationName: String?
+    let organizationUuid: String?
+    let accountUuid: String?
+    let organizationType: String?      // e.g. "claude_team", "claude_business"
+    let seatTier: String?              // e.g. "team_tier_1"
+    let billingType: String?           // e.g. "stripe_subscription"
+    let userRateLimitTier: String?
+    let organizationRateLimitTier: String?
+    let hasExtraUsageEnabled: Bool
+    let accountCreatedAt: String?
+    let subscriptionCreatedAt: String?
+
+    /// Prevents accidental PII/credential leakage if the struct is logged as a whole.
+    var description: String {
+        "OAuthIdentity(email: \(emailAddress), org: \(organizationName ?? "nil"))"
+    }
+
+    /// Normalised subscription-type label (e.g. "Team", "Max", "Pro")
+    var subscriptionTypeLabel: String? {
+        // Prefer seatTier → organizationType → nil
+        if let tier = seatTier {
+            // "team_tier_1" → "Team"
+            let parts = tier.split(separator: "_")
+            if let first = parts.first {
+                return first.prefix(1).uppercased() + first.dropFirst()
+            }
+        }
+        if let orgType = organizationType {
+            // "claude_team" → "Team", "claude_business" → "Business"
+            let name = orgType.replacingOccurrences(of: "claude_", with: "")
+            return name.prefix(1).uppercased() + name.dropFirst()
+        }
+        return nil
     }
 }

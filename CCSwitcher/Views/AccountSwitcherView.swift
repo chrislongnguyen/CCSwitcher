@@ -106,6 +106,9 @@ struct AccountSwitcherView: View {
                         if account.isActive {
                             Badge(text: String(localized: "Active", bundle: L10n.bundle), color: .green)
                         }
+                        if appState.accountUsageErrors[account.id]?.isExpired == true {
+                            Badge(text: String(localized: "Stale token"), color: .orange)
+                        }
                     }
                 }
 
@@ -128,13 +131,27 @@ struct AccountSwitcherView: View {
             Spacer()
 
             // Actions
+            let isExpired = appState.accountUsageErrors[account.id]?.isExpired == true
             if !account.isActive {
-                Button("Switch") {
-                    Task { await appState.switchTo(account) }
+                if isExpired {
+                    // Switching to an expired-token account will fail at the probe step,
+                    // forcing the user back here. Skip the misleading "Switch" button and
+                    // route them straight to Re-authenticate.
+                    Button("Re-authenticate") {
+                        Task { await appState.reauthenticateAccount(account) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.orange)
+                    .help("This account's saved token is no longer valid. Re-authenticate to refresh it.")
+                } else {
+                    Button("Switch") {
+                        Task { await appState.switchTo(account) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.brand)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .tint(.brand)
             }
 
             Button {
